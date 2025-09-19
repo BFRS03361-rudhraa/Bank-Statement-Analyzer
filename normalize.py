@@ -2,6 +2,7 @@ import os
 import re
 import pandas as pd
 from collections import Counter
+from difflib import get_close_matches
 
 def detect_date_column(df):
     """Detect date column by looking for specific patterns like 'date', 'value date', 'txn date'."""
@@ -25,6 +26,74 @@ def detect_date_column(df):
     
     # If no specific date column found, return None (no fallback)
     return None
+
+def normalize_headers(df):
+    """Normalize headers to standard format: Date, Credit/Debit, Description, Amount, Balance + additional columns."""
+    
+    # Define our standard column mappings
+    standard_columns = {
+        'Date': ['date', 'value date', 'txn date', 'transaction date', 'value_date', 'txn_date', 'transaction_date'],
+        'Credit/Debit': ['cr/dr', 'cr dr', 'credit debit', 'type', 'transaction type', 'debit credit'],
+        'Description': ['description', 'narration', 'particulars', 'details', 'transaction details'],
+        'Amount': ['amount', 'transaction amount', 'value', 'transaction value', 'amount(inr)', 'transaction amount(inr)'],
+        'Balance': ['balance', 'available balance', 'running balance', 'closing balance', 'available balance(inr)']
+    }
+    
+    # Create mapping from original columns to standard columns
+    column_mapping = {}
+    used_standard_cols = set()
+    
+    # First pass: try to map each original column to a standard column
+    for orig_col in df.columns:
+        orig_col_lower = orig_col.lower().strip()
+        mapped = False
+        
+        for std_col, patterns in standard_columns.items():
+            if std_col not in used_standard_cols:  # Don't reuse standard columns
+                for pattern in patterns:
+                    if re.search(pattern, orig_col_lower):
+                        column_mapping[orig_col] = std_col
+                        used_standard_cols.add(std_col)
+                        mapped = True
+                        break
+                if mapped:
+                    break
+        
+        # If no standard mapping found, keep original column name
+        if not mapped:
+            column_mapping[orig_col] = orig_col
+    
+    # Create new dataframe with normalized headers
+    new_df = df.copy()
+    new_df = new_df.rename(columns=column_mapping)
+    
+    # Reorder columns: standard columns first, then additional columns
+    final_columns = []
+    
+    # Add standard columns in order (if they exist)
+    for std_col in ['Date', 'Credit/Debit', 'Description', 'Amount', 'Balance']:
+        if std_col in new_df.columns:
+            final_columns.append(std_col)
+    
+    # Add any additional columns that aren't in our standard set
+    for col in new_df.columns:
+        if col not in final_columns:
+            final_columns.append(col)
+    
+    # Reorder the dataframe
+    new_df = new_df[final_columns]
+    
+    # Normalize Credit/Debit values to DEBIT and CREDIT
+    if 'Credit/Debit' in new_df.columns:
+        new_df['Credit/Debit'] = new_df['Credit/Debit'].astype(str).str.upper()
+        new_df['Credit/Debit'] = new_df['Credit/Debit'].replace({
+            'DR': 'DEBIT',
+            'CR': 'CREDIT',
+            'D': 'DEBIT',
+            'C': 'CREDIT'
+        })
+    
+    return new_df
 
 def get_file_date_range(file_path):
     """Extract first and last transaction dates from a file (first and last rows only)."""
@@ -62,8 +131,9 @@ def normalize_to_reference(excel_files):
     transactions_list = []
     metadata_list = []
 
-    # Load reference header from the first file
+    # Load reference header from the first file and normalize it
     ref_df = pd.read_excel(excel_files[0], sheet_name="Transactions")
+    ref_df = normalize_headers(ref_df)
     reference_headers = list(ref_df.columns)
 
     for file in excel_files:
@@ -73,8 +143,8 @@ def normalize_to_reference(excel_files):
         try:
             df = pd.read_excel(file, sheet_name="Transactions")
 
-            # Force headers to match reference
-            df.columns = reference_headers[:len(df.columns)]
+            # Normalize headers to standard format
+            df = normalize_headers(df)
 
             # Just detect date column, don't modify the data here
             date_col = detect_date_column(df)
