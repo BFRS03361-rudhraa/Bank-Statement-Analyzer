@@ -1,48 +1,84 @@
 import os
+import re
 import pandas as pd
 from collections import Counter
 
-def get_min_date_from_file(file):
-    """Extract the minimum valid date from any 'date' column in the Transactions sheet."""
+def detect_date_column(df):
+    """Detect date column by looking for specific patterns like 'date', 'value date', 'txn date'."""
+    # First, look for exact matches with common date column names
+    date_patterns = [
+        r'date', r'value\s*date', r'txn\s*date', r'transaction\s*date',
+        r'value_date', r'txn_date', r'transaction_date'
+    ]
+    
+    for col in df.columns:
+        col_lower = col.lower().strip()
+        for pattern in date_patterns:
+            if re.search(pattern, col_lower):
+                try:
+                    # Verify this column actually contains dates using DD/MM/YYYY format
+                    sample = pd.to_datetime(df[col].dropna().astype(str), format='%d/%m/%Y', errors='coerce')
+                    if sample.notna().sum() > 0:
+                        return col
+                except Exception:
+                    continue
+    
+    # If no specific date column found, return None (no fallback)
+    return None
+
+def get_file_date_range(file_path):
+    """Extract first and last transaction dates from a file (first and last rows only)."""
     try:
-        df = pd.read_excel(file, sheet_name="Transactions")
-        date_cols = [c for c in df.columns if "date" in c.lower()]
-        all_dates = []
-        for col in date_cols:
-            dates = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
-            all_dates.extend(dates.dropna())
-        if all_dates:
-            return min(all_dates)
+        df = pd.read_excel(file_path, sheet_name="Transactions")
+        date_col = detect_date_column(df)
+        
+        if date_col is None:
+            print(f"Warning: No date column found in {file_path}")
+            return None, None
+        
+        if df.empty:
+            print(f"Warning: No transactions found in {file_path}")
+            return None, None
+        
+        # Convert to datetime using DD/MM/YYYY format
+        df[date_col] = pd.to_datetime(df[date_col], format='%d/%m/%Y', errors='coerce')
+        
+        # Get first and last transaction dates (first and last rows)
+        first_date = df[date_col].iloc[0]  # First row
+        last_date = df[date_col].iloc[-1]  # Last row
+        
+        # Check if dates are valid
+        if pd.isna(first_date) or pd.isna(last_date):
+            print(f"Warning: Invalid dates in first/last rows of {file_path}")
+            return None, None
+        
+        return first_date, last_date
+        
     except Exception as e:
-        print(f"Warning: Could not extract dates from {file}: {e}")
-    return pd.NaT
+        print(f"Error reading {file_path}: {e}")
+        return None, None
 
 def normalize_to_reference(excel_files):
     transactions_list = []
     metadata_list = []
 
-    # Sort files by earliest date in each file
-    file_dates = [(f, get_min_date_from_file(f)) for f in excel_files]
-    sorted_files = sorted(file_dates, key=lambda x: (pd.isna(x[1]), x[1]))
-    sorted_files = [f for f, _ in sorted_files]
-
-    # Use the first file as reference for headers
-    ref_df = pd.read_excel(sorted_files[0], sheet_name="Transactions")
+    # Load reference header from the first file
+    ref_df = pd.read_excel(excel_files[0], sheet_name="Transactions")
     reference_headers = list(ref_df.columns)
 
-    for file in sorted_files:
+    for file in excel_files:
         print(f"Processing: {file}")
 
         # ---- Transactions ----
         try:
             df = pd.read_excel(file, sheet_name="Transactions")
+
+            # Force headers to match reference
             df.columns = reference_headers[:len(df.columns)]
 
-            # Normalize any date columns
-            date_cols = [c for c in df.columns if "date" in c.lower()]
-            for col in date_cols:
-                df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
-
+            # Just detect date column, don't modify the data here
+            date_col = detect_date_column(df)
+            
             transactions_list.append(df)
         except Exception as e:
             print(f"Warning: Could not read Transactions from {file}: {e}")
@@ -56,14 +92,12 @@ def normalize_to_reference(excel_files):
             print(f"Warning: Could not read Metadata from {file}: {e}")
 
     # ---- Consolidated Transactions ----
-    combined_transactions = pd.concat(transactions_list, ignore_index=True) if transactions_list else pd.DataFrame()
+    combined_transactions = (
+        pd.concat(transactions_list, ignore_index=True)
+        if transactions_list else pd.DataFrame()
+    )
 
-    # Sort by all date columns (if any exist)
-    date_cols = [c for c in combined_transactions.columns if "date" in c.lower()]
-    if date_cols:
-        combined_transactions = combined_transactions.sort_values(
-            by=date_cols, ascending=True, na_position="last"
-        ).reset_index(drop=True)
+    # No need to sort here since files are already processed in correct order
 
     # ---- Consolidated Metadata ----
     all_keys = set(k for md in metadata_list for k in md.keys())
@@ -74,6 +108,7 @@ def normalize_to_reference(excel_files):
         aggregated_metadata[key] = most_common[0][0] if most_common else ''
 
     return combined_transactions, aggregated_metadata
+
 
 def consolidate_excels(input_folder, output_file):
     excel_files = [
@@ -87,7 +122,26 @@ def consolidate_excels(input_folder, output_file):
 
     print(f"Found {len(excel_files)} Excel files to process.")
 
-    transactions, metadata = normalize_to_reference(excel_files)
+    # Sort files by their first transaction date
+    print("Analyzing first transaction dates in files...")
+    file_date_info = []
+    
+    for file_path in excel_files:
+        first_date, last_date = get_file_date_range(file_path)
+        if first_date is not None and last_date is not None:
+            file_date_info.append((file_path, first_date, last_date))
+            print(f"  {os.path.basename(file_path)}: First txn: {first_date.date()}, Last txn: {last_date.date()}")
+        else:
+            print(f"  {os.path.basename(file_path)}: No valid dates found - will be processed last")
+            file_date_info.append((file_path, None, None))
+    
+    # Sort by first transaction date only (files with no date will be last)
+    file_date_info.sort(key=lambda x: x[1] if x[1] is not None else pd.Timestamp.max)
+    sorted_excel_files = [info[0] for info in file_date_info]
+    
+    print(f"Files will be processed in chronological order based on first transaction date.")
+    
+    transactions, metadata = normalize_to_reference(sorted_excel_files)
 
     # Save
     with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
@@ -98,6 +152,7 @@ def consolidate_excels(input_folder, output_file):
         )
 
     print(f"Saved consolidated file: {output_file}")
+
 
 if __name__ == "__main__":
     import argparse
