@@ -4,21 +4,47 @@ import pandas as pd
 from collections import Counter
 from difflib import get_close_matches
 
+
+def parse_transaction_dates(series):
+    """
+    Parse a series of transaction date strings using multiple expected formats.
+    Returns a datetime series.
+    """
+    formats = [
+        "%d/%m/%Y %I:%M:%S %p",  # 02/09/2024 01:01:43 PM
+        "%d/%m/%Y",               # 02/09/2024
+        "%Y-%m-%d",               # 2024-09-02
+        "%d-%m-%Y",               # 02-09-2024
+        "%d/%m/%y %H:%M:%S",      # fallback 24h time
+    ]
+    
+    for fmt in formats:
+        try:
+            parsed = pd.to_datetime(series.astype(str), format=fmt, errors='coerce')
+            if parsed.notna().sum() > 0:
+                return parsed
+        except Exception:
+            continue
+    
+    # fallback: let pandas infer using dateutil
+    return pd.to_datetime(series.astype(str), errors='coerce', dayfirst=True)
+
+
 def detect_date_column(df):
     """Detect date column by looking for specific patterns like 'date', 'value date', 'txn date'."""
     # First, look for exact matches with common date column names
     date_patterns = [
-        r'date', r'value\s*date', r'txn\s*date', r'transaction\s*date',
-        r'value_date', r'txn_date', r'transaction_date'
+       r'txn\s*date', r'transaction\s*date',  # highest priority
+        r'date'  # generic date last
     ]
-    
-    for col in df.columns:
-        col_lower = col.lower().strip()
-        for pattern in date_patterns:
+    for pattern in date_patterns:
+        for col in df.columns:
+            col_lower = col.lower().strip()
+        
             if re.search(pattern, col_lower):
                 try:
                     # Verify this column actually contains dates using DD/MM/YYYY format
-                    sample = pd.to_datetime(df[col].dropna().astype(str), format='%d/%m/%Y', errors='coerce')
+                    sample = parse_transaction_dates(df[col].dropna().astype(str))
                     if sample.notna().sum() > 0:
                         return col
                 except Exception:
@@ -32,10 +58,10 @@ def normalize_headers(df):
     
     # Define our standard column mappings
     standard_columns = {
-        'Date': ['date', 'value date', 'txn date', 'transaction date', 'value_date', 'txn_date', 'transaction_date'],
+        'Date': ['txn posted date', 'transaction date', 'txn_date', 'transaction_date'],
         'Credit/Debit': ['cr/dr', 'cr dr', 'credit debit', 'type', 'transaction type', 'debit credit'],
         'Description': ['description', 'narration', 'particulars', 'details', 'transaction details'],
-        'Amount': ['amount', 'transaction amount', 'value', 'transaction value', 'amount(inr)', 'transaction amount(inr)'],
+        'Amount': ['amount', 'transaction amount', 'transaction value', 'amount(inr)', 'transaction amount(inr)'],
         'Balance': ['balance', 'available balance', 'running balance', 'closing balance', 'available balance(inr)']
     }
     
@@ -82,6 +108,11 @@ def normalize_headers(df):
     
     # Reorder the dataframe
     new_df = new_df[final_columns]
+    if 'Date' in new_df.columns:
+        new_df['Date'] = parse_transaction_dates(new_df['Date'])
+        # Standardize to DD/MM/YYYY string
+        new_df['Date'] = new_df['Date'].dt.strftime('%d/%m/%Y')
+
     
     # Normalize Credit/Debit values to DEBIT and CREDIT
     if 'Credit/Debit' in new_df.columns:
@@ -110,7 +141,7 @@ def get_file_date_range(file_path):
             return None, None
         
         # Convert to datetime using DD/MM/YYYY format
-        df[date_col] = pd.to_datetime(df[date_col], format='%d/%m/%Y', errors='coerce')
+        df[date_col] = pd.to_datetime(df[date_col], errors='coerce', dayfirst=True )
         
         # Get first and last transaction dates (first and last rows)
         first_date = df[date_col].iloc[0]  # First row
@@ -145,7 +176,6 @@ def normalize_to_reference(excel_files):
 
             # Normalize headers to standard format
             df = normalize_headers(df)
-
             # Just detect date column, don't modify the data here
             date_col = detect_date_column(df)
             
