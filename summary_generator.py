@@ -126,6 +126,7 @@ def generate_monthwise_analysis(transactions_df):
     
     # Extract month-year for grouping
     transactions_df['Month_Year'] = transactions_df['Date'].dt.to_period('M')
+    print("sgwrg",transactions_df)
     
     # Clean Amount column
     transactions_df['Amount_Clean'] = transactions_df['Amount'].astype(str).str.replace(',', '').str.replace(' ', '')
@@ -192,8 +193,11 @@ def generate_monthwise_analysis(transactions_df):
     # Create DataFrame
     monthly_df = pd.DataFrame(monthly_data)
     
-    # Sort by month
-    monthly_df = monthly_df.sort_values('Month')
+    # Sort months chronologically by parsing Month like 'Sep-24'
+    if not monthly_df.empty and 'Month' in monthly_df.columns:
+        monthly_df['_order'] = pd.to_datetime(monthly_df['Month'], format='%b-%y', errors='coerce')
+        monthly_df = monthly_df.sort_values('_order').drop(columns=['_order'])
+    
     
     # Add Total row
     total_row = {
