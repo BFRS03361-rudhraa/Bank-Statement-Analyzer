@@ -242,6 +242,78 @@ def generate_monthwise_analysis(transactions_df):
     
     return monthly_df
 
+
+def generate_eod_balances(transactions_df):
+    """Generate End-Of-Day balance matrix: rows are Day 1..31, columns are Month-Year.
+    For days without transactions, carry forward the previous day's balance."""
+    if transactions_df.empty:
+        return pd.DataFrame()
+
+    # Prepare dates and clean balance
+    df = transactions_df.copy()
+    df['Date'] = pd.to_datetime(df['Date'], format='%d/%m/%Y', errors='coerce')
+    balance_cols = [col for col in df.columns if 'balance' in col.lower()]
+    if not balance_cols:
+        return pd.DataFrame()
+    balance_col = balance_cols[0]
+    df['Balance_Clean'] = (
+        df[balance_col].astype(str).str.replace(',', '').str.replace(' ', '')
+    )
+    df['Balance_Clean'] = pd.to_numeric(df['Balance_Clean'], errors='coerce')
+
+    # Drop rows without valid date
+    df = df.dropna(subset=['Date'])
+    if df.empty:
+        return pd.DataFrame()
+
+    # Month period
+    df['Month_Year'] = df['Date'].dt.to_period('M')
+
+    # Determine chronological list of months present
+    months = sorted(df['Month_Year'].unique())
+
+    # Build EOD matrix
+    max_days = 31
+    data = {'Day': list(range(1, max_days + 1))}
+
+    prev_month_last_balance = np.nan
+    for period in months:
+        month_df = df[df['Month_Year'] == period].sort_values('Date')
+        # Map day -> last balance that day
+        day_last_balance = (
+            month_df.groupby(month_df['Date'].dt.day)['Balance_Clean'].last()
+        )
+        eod_values = []
+        # Initialize with previous month's closing balance so the new month starts carried-forward
+        prev_balance = prev_month_last_balance
+        # Determine number of days in month
+        year = int(period.year)
+        month = int(period.month)
+        _, days_in_month = calendar.monthrange(year, month)
+        for day in range(1, max_days + 1):
+            if day <= days_in_month:
+                if day in day_last_balance.index:
+                    prev_balance = day_last_balance.loc[day]
+                # if no transaction, carry forward previous balance (may still be NaN before first txn)
+                eod_values.append(prev_balance)
+            else:
+                # days beyond actual month -> keep as NaN
+                eod_values.append(np.nan)
+
+        col_label = f"{calendar.month_abbr[month]} - {year}"
+        data[col_label] = eod_values
+
+        # Update previous month last balance for carry-forward to the next month
+        # Use the last non-null within the month's valid days
+        month_last_valid = pd.Series(eod_values[:days_in_month]).dropna()
+        if not month_last_valid.empty:
+            prev_month_last_balance = month_last_valid.iloc[-1]
+        # If still NaN (no data this month), keep previous month's value unchanged
+
+    eod_df = pd.DataFrame(data)
+
+    return eod_df
+
 def get_balance_on_date(month_group, day):
     """Get balance on a specific day of the month."""
     # Filter transactions for the specific day
@@ -354,15 +426,23 @@ def generate_summary_sheet(normalized_file, output_file):
     print("[INFO] Generating month-wise analysis...")
     monthly_analysis = generate_monthwise_analysis(transactions_df.copy())
     
+    # Generate EOD Balances
+    print("[INFO] Generating EOD balances...")
+    eod_balances = generate_eod_balances(transactions_df.copy())
+    
     # Save to Excel
     with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
         summary_df.to_excel(writer, index=False, sheet_name='Summary - Scorecard')
         monthly_analysis.to_excel(writer, index=False, sheet_name='Month-wise Analysis')
+        if not eod_balances.empty:
+            eod_balances.to_excel(writer, index=False, sheet_name='EOD Balances')
         transactions_df.to_excel(writer, index=False, sheet_name='Xns')
     
     print(f"[SUCCESS] Saved summary sheet to {output_file}")
     print(f"[INFO] Summary contains {len(summary_data)} items")
     print(f"[INFO] Month-wise analysis contains {len(monthly_analysis)} months")
+    if 'Day' in (eod_balances.columns if isinstance(eod_balances, pd.DataFrame) else []):
+        print(f"[INFO] EOD Balances generated for {len([c for c in eod_balances.columns if c != 'Day'])} months")
     
     # Display summary
     print("\n" + "="*60)
