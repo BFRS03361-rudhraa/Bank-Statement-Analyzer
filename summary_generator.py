@@ -9,6 +9,206 @@ import numpy as np
 from datetime import datetime
 import calendar
 
+
+def _to_numeric(series):
+    """Helper: clean commas/spaces and convert to numeric."""
+    s = series.astype(str).str.replace(',', '').str.replace(' ', '')
+    return pd.to_numeric(s, errors='coerce')
+
+
+def generate_scoring_details(transactions_df):
+    """Compute scoring metrics similar to the Scoring Details sheet.
+
+    Expects standard columns: `Date`, `Credit/Debit`, `Description`, `Amount`, `Balance`.
+    Returns a 2-column DataFrame with Description and Value.
+    """
+    if transactions_df.empty:
+        return pd.DataFrame({
+            'Description': [
+                'Monthly Average Inflow', 'Monthly Average Outflow', 'Average Credit Transactions',
+                'Average Debit Transactions', 'Total Credit Amount', 'Total Debit Amount',
+                'Total Count of Credit Transactions', 'Total Count of Debit Transactions',
+                'Monthly Average Surplus', 'Fixed Obligation To Income Ratio',
+                'Maximum Balance', 'Minimum Balance', 'Maximum Credit', 'Minimum Credit',
+                'Maximum Debit', 'Minimum Debit',
+                'Month end balance in last 90 days', 'Month end balance in last 180 days',
+                'Number of Cash withdrawal in last 3 months', 'Number of Cash withdrawal in last 6 months',
+                'Count of interest credited in last 3 months', 'Amount of interest credited in last 3 months',
+                'Count of interest credited in last 6 months', 'Amount of interest credited in last 6 months',
+                'Count of Cheque Bounce in last 3 months', 'Amount of Cheque Bounce in last 3 months',
+                'Count of Cheque Bounce in last 6 months', 'Amount of Cheque Bounce in last 6 months',
+                'Velocity - (Sum of debits and credits) /AMB in the last 3 months',
+                'Velocity - (Sum of debits and credits) /AMB in the last 6 months'
+            ],
+            'Value': ['NA'] * 30
+        })
+
+    df = transactions_df.copy()
+    # Dates
+    df['Date'] = pd.to_datetime(df['Date'], format='%d/%m/%Y', errors='coerce')
+    df = df.dropna(subset=['Date'])
+    # Amounts signed by Credit/Debit
+    df['Amount_Clean'] = _to_numeric(df['Amount'])
+    # Balance
+    df['Balance_Clean'] = _to_numeric(df['Balance']) if 'Balance' in df.columns else pd.NA
+
+    # Derive signed amounts
+    df['Credit_Amount'] = df.loc[df['Credit/Debit'] == 'CREDIT', 'Amount_Clean']
+    df['Debit_Amount'] = df.loc[df['Credit/Debit'] == 'DEBIT', 'Amount_Clean']
+
+    # Month key
+    df['Month'] = df['Date'].dt.to_period('M')
+
+    # Monthly aggregates
+    monthly = df.groupby('Month').agg(
+        credit_sum=pd.NamedAgg(column='Credit_Amount', aggfunc='sum'),
+        debit_sum=pd.NamedAgg(column='Debit_Amount', aggfunc='sum'),
+        credit_cnt=pd.NamedAgg(column='Credit_Amount', aggfunc=lambda s: s.notna().sum()),
+        debit_cnt=pd.NamedAgg(column='Debit_Amount', aggfunc=lambda s: s.notna().sum()),
+        avg_balance=pd.NamedAgg(column='Balance_Clean', aggfunc='mean')
+    ).fillna(0)
+
+    # Monthly Average Inflow/Outflow (mean of monthly sums)
+    monthly_avg_inflow = round(monthly['credit_sum'].mean(), 2) if not monthly.empty else 0
+    monthly_avg_outflow = round(monthly['debit_sum'].mean(), 2) if not monthly.empty else 0
+
+    # Average Credit/Debit Transactions (mean of monthly amounts)
+    avg_credit_txn = round(monthly['credit_sum'].mean(), 2) if not monthly.empty else 0
+    avg_debit_txn = round(monthly['debit_sum'].mean(), 2) if not monthly.empty else 0
+
+    # Totals
+    total_credit_amount = round(df['Credit_Amount'].sum(skipna=True), 2)
+    total_debit_amount = round(df['Debit_Amount'].sum(skipna=True), 2)
+    total_credit_count = int(df['Credit_Amount'].notna().sum())
+    total_debit_count = int(df['Debit_Amount'].notna().sum())
+
+    # Monthly Average Surplus = mean(credit_sum - debit_sum)
+    monthly_surplus = round((monthly['credit_sum'] - monthly['debit_sum']).mean(), 2) if not monthly.empty else 0
+
+    # Foir placeholder (needs liabilities to compute). Mark as NA to match screenshot.
+    foi_ratio = 'NA'
+
+    # Balance extremes
+    max_balance = round(df['Balance_Clean'].max(skipna=True), 2) if 'Balance_Clean' in df else 'NA'
+    min_balance = round(df['Balance_Clean'].min(skipna=True), 2) if 'Balance_Clean' in df else 'NA'
+
+    # Credit/Debit extremes
+    max_credit = round(df['Credit_Amount'].max(skipna=True), 2) if df['Credit_Amount'].notna().any() else 0
+    min_credit = round(df['Credit_Amount'].min(skipna=True), 2) if df['Credit_Amount'].notna().any() else 0
+    max_debit = round(df['Debit_Amount'].max(skipna=True), 2) if df['Debit_Amount'].notna().any() else 0
+    min_debit = round(df['Debit_Amount'].min(skipna=True), 2) if df['Debit_Amount'].notna().any() else 0
+
+    # Month end balances: last balance of each month
+    month_end_balance = (
+        df.sort_values('Date').groupby('Month')['Balance_Clean'].last()
+    )
+    last_90d_cut = df['Date'].max() - pd.Timedelta(days=90)
+    last_180d_cut = df['Date'].max() - pd.Timedelta(days=180)
+    meb_90 = round(month_end_balance[month_end_balance.index.to_timestamp() >= last_90d_cut].mean(), 2) if not month_end_balance.empty else 0
+    meb_180 = round(month_end_balance[month_end_balance.index.to_timestamp() >= last_180d_cut].mean(), 2) if not month_end_balance.empty else 0
+
+    # Helpers for last N months
+    def last_n_months(n):
+        if df.empty:
+            return df.iloc[0:0]
+        last_month = df['Month'].max()
+        months = [(last_month - i).strftime('%Y-%m') for i in range(n)]
+        return df[df['Month'].astype(str).isin(months)]
+
+    # Cash withdrawals: infer by Description contains 'cash' and Debit
+    desc = df['Description'].astype(str).str.lower() if 'Description' in df.columns else pd.Series([], dtype=str)
+    cash_mask = desc.str.contains('cash', na=False)
+    def count_cash_withdrawals(n):
+        sub = last_n_months(n)
+        if sub.empty:
+            return 0
+        return int(((sub['Credit/Debit'] == 'DEBIT') & cash_mask.loc[sub.index]).sum())
+
+    cash_3m = count_cash_withdrawals(3)
+    cash_6m = count_cash_withdrawals(6)
+
+    # Interest credited: Description contains 'interest' and CREDIT
+    interest_mask = desc.str.contains('interest', na=False)
+    def stats_interest(n):
+        sub = last_n_months(n)
+        if sub.empty:
+            return 0, 0.0
+        m = (sub['Credit/Debit'] == 'CREDIT') & interest_mask.loc[sub.index]
+        count = int(m.sum())
+        amt = round(sub.loc[m, 'Amount_Clean'].sum(), 2)
+        return count, amt
+
+    ic3_cnt, ic3_amt = stats_interest(3)
+    ic6_cnt, ic6_amt = stats_interest(6)
+
+    # Cheque bounce: Description contains keywords
+    bounce_mask = desc.str.contains('bounce|returned|dishonour|insufficient funds|cheque return', na=False)
+    def stats_bounce(n):
+        sub = last_n_months(n)
+        if sub.empty:
+            return 0, 0.0
+        m = bounce_mask.loc[sub.index]
+        count = int(m.sum())
+        amt = round(sub.loc[m, 'Amount_Clean'].sum(), 2)
+        return count, amt
+
+    cb3_cnt, cb3_amt = stats_bounce(3)
+    cb6_cnt, cb6_amt = stats_bounce(6)
+
+    # Velocity = (sum of debits and credits)/AMB for last N months
+    def velocity(n):
+        sub = last_n_months(n)
+        if sub.empty:
+            return 0.0
+        # AMB approximate as mean monthly avg balances over N months
+        sub_monthly = sub.groupby(sub['Date'].dt.to_period('M')).agg(
+            sum_amt=pd.NamedAgg(column='Amount_Clean', aggfunc=lambda s: s.abs().sum()),
+            amb=pd.NamedAgg(column='Balance_Clean', aggfunc='mean')
+        ).fillna(0)
+        amb = sub_monthly['amb'].replace(0, pd.NA).mean(skipna=True)
+        total_turnover = sub_monthly['sum_amt'].sum()
+        if pd.isna(amb) or amb == 0:
+            return 0.0
+        return round(total_turnover / amb, 2)
+
+    velocity_3 = velocity(3)
+    velocity_6 = velocity(6)
+
+    rows = [
+        ('Monthly Average Inflow', monthly_avg_inflow),
+        ('Monthly Average Outflow', monthly_avg_outflow),
+        ('Average Credit Transactions', avg_credit_txn),
+        ('Average Debit Transactions', avg_debit_txn),
+        ('Total Credit Amount', round(total_credit_amount, 2)),
+        ('Total Debit Amount', round(total_debit_amount, 2)),
+        ('Total Count of Credit Transactions', total_credit_count),
+        ('Total Count of Debit Transactions', total_debit_count),
+        ('Monthly Average Surplus', monthly_surplus),
+        ('Fixed Obligation To Income Ratio', foi_ratio),
+        ('Maximum Balance', max_balance),
+        ('Minimum Balance', min_balance),
+        ('Maximum Credit', max_credit),
+        ('Minimum Credit', min_credit),
+        ('Maximum Debit', max_debit),
+        ('Minimum Debit', min_debit),
+        ('Month end balance in last 90 days', meb_90),
+        ('Month end balance in last 180 days', meb_180),
+        ('Number of Cash withdrawal in last 3 months', cash_3m),
+        ('Number of Cash withdrawal in last 6 months', cash_6m),
+        ('Count of interest credited in last 3 months', ic3_cnt),
+        ('Amount of interest credited in last 3 months', ic3_amt),
+        ('Count of interest credited in last 6 months', ic6_cnt),
+        ('Amount of interest credited in last 6 months', ic6_amt),
+        ('Count of Cheque Bounce in last 3 months', cb3_cnt),
+        ('Amount of Cheque Bounce in last 3 months', cb3_amt),
+        ('Count of Cheque Bounce in last 6 months', cb6_cnt),
+        ('Amount of Cheque Bounce in last 6 months', cb6_amt),
+        ('Velocity - (Sum of debits and credits) /AMB in the last 3 months', velocity_3),
+        ('Velocity - (Sum of debits and credits) /AMB in the last 6 months', velocity_6),
+    ]
+
+    return pd.DataFrame(rows, columns=['Description', 'Value'])
+
 def load_normalized_data(normalized_file):
     """Load the consolidated data from the normalized output file."""
     try:
@@ -429,11 +629,17 @@ def generate_summary_sheet(normalized_file, output_file):
     # Generate EOD Balances
     print("[INFO] Generating EOD balances...")
     eod_balances = generate_eod_balances(transactions_df.copy())
+
+    # Generate Scoring Details
+    print("[INFO] Generating Scoring Details...")
+    scoring_df = generate_scoring_details(transactions_df.copy())
     
     # Save to Excel
     with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
         summary_df.to_excel(writer, index=False, sheet_name='Summary - Scorecard')
         monthly_analysis.to_excel(writer, index=False, sheet_name='Month-wise Analysis')
+        if not scoring_df.empty:
+            scoring_df.to_excel(writer, index=False, sheet_name='Scoring Details')
         if not eod_balances.empty:
             eod_balances.to_excel(writer, index=False, sheet_name='EOD Balances')
         transactions_df.to_excel(writer, index=False, sheet_name='Xns')
