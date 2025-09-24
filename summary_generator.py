@@ -8,7 +8,10 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import calendar
+from rapidfuzz import fuzz
+from rc import similarity_threshold
 
+similarity_threshold =70  #for calculating the recurring debit and credit sheet
 
 def _to_numeric(series):
     """Helper: clean commas/spaces and convert to numeric."""
@@ -530,6 +533,57 @@ def get_balance_on_date(month_group, day):
         else:
             return 0
 
+
+def generate_recurring_credit_debit(transactions_df, val):
+
+    if transactions_df.empty:
+        return "NA"           
+    df_credit = transactions_df[transactions_df['Credit/Debit'].str.upper() == val].copy()
+
+    # Function to assign group based on description similarity
+    groups = []
+
+    def assign_group(desc):
+        for i, group in enumerate(groups):
+            # Compare with first element of the group
+            if fuzz.token_set_ratio(desc, group[0]) >= similarity_threshold:
+                group.append(desc)
+                return i+1
+        # If no match, create a new group
+        groups.append([desc])
+        return len(groups)
+
+    # Assign group index for each description
+    df_credit['Group'] = df_credit['Description'].apply(assign_group)
+
+    # Create canonical name for each group (first description in the group)
+    # canonical_names = {i: group[0] for i, group in enumerate(groups)}
+    # df_credit['Canonical_Description'] = df_credit['Group'].map(canonical_names)
+
+    # Filter out groups with only 1 transaction
+    group_counts = df_credit['Group'].value_counts()
+    valid_groups = group_counts[group_counts > 1].index
+    df_credit = df_credit[df_credit['Group'].isin(valid_groups)].copy()
+
+    # Reassign group numbers sequentially
+    old_to_new = {old: new+1 for new, old in enumerate(sorted(valid_groups))}
+    df_credit['Group'] = df_credit['Group'].map(old_to_new)
+
+    # Re-map canonical descriptions after removing single-entry groups
+    # new_canonical_names = {new: canonical_names[old] for old, new in old_to_new.items()}
+    # df_credit['Canonical_Description'] = df_credit['Group'].map(new_canonical_names)
+
+
+    columns_order = ['Date', 'Group', 'Description', 'Amount', 'Balance']
+    output_df = df_credit[columns_order]
+    recurring_credit_df = output_df.sort_values(by=['Group', 'Description'])
+    # Aggregate amounts per canonical description
+    return recurring_credit_df
+
+
+    print(f"Grouped credit transactions saved to {output_file}")
+
+
 def generate_summary_sheet(normalized_file, output_file):
     """Generate the standardized summary sheet."""
     print(f"[INFO] Loading normalized data from {normalized_file}")
@@ -633,6 +687,13 @@ def generate_summary_sheet(normalized_file, output_file):
     # Generate Scoring Details
     print("[INFO] Generating Scoring Details...")
     scoring_df = generate_scoring_details(transactions_df.copy())
+
+    print("[INFO] Generating Recurring Credit Details...")
+    recurring_credit_df = generate_recurring_credit_debit(transactions_df.copy(), val='CREDIT')
+
+    print("[INFO] Generating Recurring Debit Details...")
+    recurring_debit_df = generate_recurring_credit_debit(transactions_df.copy(), val='DEBIT')
+    
     
     # Save to Excel
     with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
@@ -642,7 +703,12 @@ def generate_summary_sheet(normalized_file, output_file):
             scoring_df.to_excel(writer, index=False, sheet_name='Scoring Details')
         if not eod_balances.empty:
             eod_balances.to_excel(writer, index=False, sheet_name='EOD Balances')
+        if not recurring_credit_df.empty:
+            recurring_credit_df.to_excel(writer, index=False, sheet_name='Recurring Credit')  
+        if not recurring_debit_df.empty:
+            recurring_debit_df.to_excel(writer, index=False, sheet_name='Recurring Debit')      
         transactions_df.to_excel(writer, index=False, sheet_name='Xns')
+
     
     print(f"[SUCCESS] Saved summary sheet to {output_file}")
     print(f"[INFO] Summary contains {len(summary_data)} items")
