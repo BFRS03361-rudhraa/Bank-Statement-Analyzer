@@ -1,3 +1,4 @@
+from math import nan
 import os
 import re
 import pandas as pd
@@ -10,32 +11,37 @@ def parse_transaction_dates(series):
     Parse a series of transaction date strings using multiple expected formats.
     Returns a datetime series.
     """
-    formats = [
-        "%d/%m/%Y %I:%M:%S %p",  # 02/09/2024 01:01:43 PM
-        "%d/%m/%Y",               # 02/09/2024
-        "%Y-%m-%d",               # 2024-09-02
-        "%d-%m-%Y",               # 02-09-2024
-        "%d/%m/%y %H:%M:%S",      # fallback 24h time
-    ]
-    
-    for fmt in formats:
-        try:
-            parsed = pd.to_datetime(series.astype(str), format=fmt, errors='coerce')
-            if parsed.notna().sum() > 0:
-                return parsed
-        except Exception:
-            continue
-    
-    # fallback: let pandas infer using dateutil
-    return pd.to_datetime(series.astype(str), errors='coerce', dayfirst=True)
+    s = series.astype(str).str.strip().str.replace("\u00A0", " ", regex=False)
+    s = s.replace({"": pd.NA, "nan": pd.NA, "NaN": pd.NA})
 
+    formats = [
+        "%d/%m/%Y %I:%M:%S %p",  # 16/07/2024 10:38:12 AM
+        "%d/%m/%Y",              # 16/07/2024
+        "%Y-%m-%d",              # 2024-09-02
+        "%d-%m-%Y",              # 02-09-2024
+        "%d/%m/%y %H:%M:%S",     # 02/09/24 13:01:43
+    ]
+
+    parsed = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+    for fmt in formats:
+        mask = parsed.isna()
+        if not mask.any():
+            break
+        parsed.loc[mask] = pd.to_datetime(s[mask], format=fmt, errors="coerce")
+
+    # final fallback: infer with day-first for leftovers
+    mask = parsed.isna()
+    if mask.any():
+        parsed.loc[mask] = pd.to_datetime(s[mask], errors="coerce", dayfirst=True)
+
+    return parsed
 
 def detect_date_column(df):
     """Detect date column by looking for specific patterns like 'date', 'value date', 'txn date'."""
     # First, look for exact matches with common date column names
     date_patterns = [
-       r'txn\s*date', r'transaction\s*date',  # highest priority
-        r'date'  # generic date last
+       r'txn\s*date', r'transaction\s*date',r'tran\s*date' ,r'txn\s*posted\s*date',  # highest priority
+          # generic date last
     ]
     for pattern in date_patterns:
         for col in df.columns:
@@ -54,28 +60,37 @@ def detect_date_column(df):
     return None
 
 def normalize_headers(df):
-    """Normalize headers to standard format: Date, Credit/Debit, Description, Amount, Balance + additional columns."""
-    
-    # Define our standard column mappings
+    """
+    Normalize headers to standard format: Date, Credit/Debit, Description, Amount, Balance
+    + additional columns. Detects the actual date column dynamically.
+    """
+    # Standard column mappings
     standard_columns = {
-        'Date': ['txn posted date', 'transaction date', 'txn_date', 'transaction_date'],
-        'Credit/Debit': ['cr/dr', 'cr dr', 'credit debit', 'type', 'transaction type', 'debit credit'],
+        'Credit/Debit': ['cr/dr','dr/cr', 'cr dr', 'credit debit', 'type', 'transaction type', 'debit credit'],
         'Description': ['description', 'narration', 'particulars', 'details', 'transaction details'],
         'Amount': ['amount', 'transaction amount', 'transaction value', 'amount(inr)', 'transaction amount(inr)'],
         'Balance': ['balance', 'available balance', 'running balance', 'closing balance', 'available balance(inr)']
     }
-    
-    # Create mapping from original columns to standard columns
+
+    new_df = df.copy()
+
+    # ---- Step 1: Detect the actual date column ----
+    date_col = detect_date_column(new_df)
+    if date_col:
+        new_df = new_df.rename(columns={date_col: 'Date'})
+    else:
+        print("Warning: No date column detected")
+
+    # ---- Step 2: Map other standard columns ----
     column_mapping = {}
-    used_standard_cols = set()
-    
-    # First pass: try to map each original column to a standard column
-    for orig_col in df.columns:
+    used_standard_cols = set(['Date'] if 'Date' in new_df.columns else [])
+    for orig_col in new_df.columns:
+        if orig_col in used_standard_cols:
+            continue
         orig_col_lower = orig_col.lower().strip()
         mapped = False
-        
         for std_col, patterns in standard_columns.items():
-            if std_col not in used_standard_cols:  # Don't reuse standard columns
+            if std_col not in used_standard_cols:
                 for pattern in patterns:
                     if re.search(pattern, orig_col_lower):
                         column_mapping[orig_col] = std_col
@@ -84,37 +99,26 @@ def normalize_headers(df):
                         break
                 if mapped:
                     break
-        
-        # If no standard mapping found, keep original column name
         if not mapped:
             column_mapping[orig_col] = orig_col
-    
-    # Create new dataframe with normalized headers
-    new_df = df.copy()
+
     new_df = new_df.rename(columns=column_mapping)
-    
-    # Reorder columns: standard columns first, then additional columns
+
+    # ---- Step 3: Reorder columns ----
     final_columns = []
-    
-    # Add standard columns in order (if they exist)
     for std_col in ['Date', 'Credit/Debit', 'Description', 'Amount', 'Balance']:
         if std_col in new_df.columns:
             final_columns.append(std_col)
-    
-    # Add any additional columns that aren't in our standard set
     for col in new_df.columns:
         if col not in final_columns:
             final_columns.append(col)
-    
-    # Reorder the dataframe
     new_df = new_df[final_columns]
-    if 'Date' in new_df.columns:
-        new_df['Date'] = parse_transaction_dates(new_df['Date'])
-        # Standardize to DD/MM/YYYY string
-        new_df['Date'] = new_df['Date'].dt.strftime('%d/%m/%Y')
 
-    
-    # Normalize Credit/Debit values to DEBIT and CREDIT
+    # ---- Step 4: Parse and standardize Date ----
+    if 'Date' in new_df.columns:
+        new_df['Date'] = parse_transaction_dates(new_df['Date']).dt.strftime('%d/%m/%Y')
+
+    # ---- Step 5: Normalize Credit/Debit values ----
     if 'Credit/Debit' in new_df.columns:
         new_df['Credit/Debit'] = new_df['Credit/Debit'].astype(str).str.upper()
         new_df['Credit/Debit'] = new_df['Credit/Debit'].replace({
@@ -123,8 +127,9 @@ def normalize_headers(df):
             'D': 'DEBIT',
             'C': 'CREDIT'
         })
-    
+
     return new_df
+
 
 def get_file_date_range(file_path):
     """Extract first and last transaction dates from a file (first and last rows only)."""
@@ -144,8 +149,16 @@ def get_file_date_range(file_path):
         df[date_col] = pd.to_datetime(df[date_col], errors='coerce', dayfirst=True )
         
         # Get first and last transaction dates (first and last rows)
-        first_date = df[date_col].iloc[0]  # First row
-        last_date = df[date_col].iloc[-1]  # Last row
+        first_date = None
+        for val in df[date_col]:
+            if pd.notna(val):
+                first_date = val
+                break
+        last_date = None
+        for val in reversed(df[date_col]):
+            if pd.notna(val):
+                last_date = val
+                break  # Last row
         
         # Check if dates are valid
         if pd.isna(first_date) or pd.isna(last_date):
@@ -176,6 +189,7 @@ def normalize_to_reference(excel_files):
 
             # Normalize headers to standard format
             df = normalize_headers(df)
+            
             # Just detect date column, don't modify the data here
             date_col = detect_date_column(df)
             
