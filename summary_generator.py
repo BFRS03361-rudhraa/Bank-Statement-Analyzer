@@ -4,11 +4,14 @@ Summary Generator - Creates a standardized summary sheet from normalized Excel d
 Takes normalized Excel file and outputs a summary sheet matching the required format.
 """
 
+from fsspec import transaction
 import pandas as pd
+from fraudsheet import df_duplicates
 import numpy as np
 from datetime import datetime
 import calendar
 from rapidfuzz import fuzz
+import holidays
 from rc import similarity_threshold
 
 similarity_threshold =70  #for calculating the recurring debit and credit sheet
@@ -574,7 +577,7 @@ def generate_recurring_credit_debit(transactions_df, val):
     # df_credit['Canonical_Description'] = df_credit['Group'].map(new_canonical_names)
 
 
-    columns_order = ['Date', 'Group', 'Description', 'Amount', 'Balance']
+    columns_order = ['Date', 'Group','Credit/Debit', 'Description', 'Amount', 'Balance']
     output_df = df_credit[columns_order]
     recurring_credit_df = output_df.sort_values(by=['Group', 'Description'])
     # Aggregate amounts per canonical description
@@ -582,6 +585,874 @@ def generate_recurring_credit_debit(transactions_df, val):
 
 
     print(f"Grouped credit transactions saved to {output_file}")
+
+def generate_duplicates(recurring_credit_df , recurring_debit_df):
+
+    credit_file = recurring_credit_df
+    debit_file = recurring_debit_df
+    max_differences = 2  # Maximum number of column differences to consider as duplicate
+# ----------------------------
+
+    def clean_amount(amount_str):
+        """Clean amount string and convert to float"""
+        if pd.isna(amount_str):
+            return np.nan
+        try:
+            # Remove commas and convert to float
+            clean_str = str(amount_str).replace(',', '')
+            return float(clean_str)
+        except:
+            return np.nan
+
+    def compare_rows(row1, row2, columns_to_compare):
+        """
+        Compare two rows with specific logic:
+        - Amount MUST match exactly
+        - Description should match mostly (minor differences allowed)
+        - Other fields should match mostly
+        - Balance is excluded from comparison
+        Returns: (is_duplicate, differences_list, reason)
+        """
+        
+        differences = []
+        is_duplicate = True
+        reason = ""
+        
+        # First check: Amount MUST match exactly (no tolerance)
+        amount1 = row1.get('Amount', np.nan)
+        amount2 = row2.get('Amount', np.nan)
+        
+        if pd.isna(amount1) or pd.isna(amount2):
+            if not (pd.isna(amount1) and pd.isna(amount2)):
+                return False, ["Amount: One is NaN"], "Amount mismatch (NaN)"
+        else:
+            if abs(float(amount1) - float(amount2)) > 0.01:  # Very small tolerance for floating point
+                return False, [f"Amount: {amount1} vs {amount2}"], "Amount mismatch"
+        
+        # Second check: Description similarity (should be mostly similar)
+        desc1 = str(row1.get('Description', ''))
+        desc2 = str(row2.get('Description', ''))
+        desc_similarity = fuzz.token_set_ratio(desc1, desc2)
+        
+        if desc_similarity < 80:  # Description should be at least 80% similar
+            return False, [f"Description similarity: {desc_similarity}%"], "Description too different"
+        
+        # Check other fields (excluding Balance and Canonical_Description)
+        other_diff_count = 0
+        for col in columns_to_compare:
+            if col in ['Balance', 'Canonical_Description']:
+                continue  # Skip these columns
+                
+            val1 = row1[col]
+            val2 = row2[col]
+            
+            # Handle NaN values
+            if pd.isna(val1) and pd.isna(val2):
+                continue
+            elif pd.isna(val1) or pd.isna(val2):
+                other_diff_count += 1
+                differences.append(f"{col}: {val1} vs {val2}")
+            # Compare values
+            elif val1 != val2:
+                other_diff_count += 1
+                differences.append(f"{col}: {val1} vs {val2}")
+        
+        # Allow only 1 difference in other fields (excluding Balance)
+        if other_diff_count > 1:
+            return False, differences, f"Too many differences in other fields: {other_diff_count}"
+        
+        # If we reach here, it's a duplicate
+        if other_diff_count > 0:
+            differences.append(f"Other differences: {other_diff_count}")
+        
+        return True, differences, "Duplicate found"
+
+    def find_duplicates(df, max_differences=2):
+        """
+        Find duplicate rows based on refined comparison logic:
+        - Amount MUST match exactly
+        - Description should be mostly similar (80%+)
+        - Other fields can have max 1 difference
+        - Balance is excluded from comparison
+        """
+        print(f"Analyzing {len(df)} rows for duplicates...")
+        
+        # Get columns to compare (exclude index, ID columns, canonical description, and balance)
+        columns_to_compare = [col for col in df.columns if col not in ['index', 'id', 'Index', 'ID', 'Canonical_Description', 'Balance']]
+        
+        print(f"Comparing columns: {columns_to_compare}")
+        print("Criteria: Amount must match exactly, Description 80%+ similar, Other fields max 1 difference")
+        
+        duplicate_groups = []
+        processed_indices = set()
+        group_id = 1
+        
+        for i in range(len(df)):
+            if i in processed_indices:
+                continue
+                
+            current_group = [i]
+            processed_indices.add(i)
+            
+            # Compare with all subsequent rows
+            for j in range(i + 1, len(df)):
+                if j in processed_indices:
+                    continue
+                    
+                is_duplicate, differences, reason = compare_rows(df.iloc[i], df.iloc[j], columns_to_compare)
+                
+                # If it's a duplicate according to our refined logic
+                if is_duplicate:
+                    current_group.append(j)
+                    processed_indices.add(j)
+            
+            # Only keep groups with 2 or more rows
+            if len(current_group) >= 2:
+                duplicate_groups.append({
+                    'group_id': group_id,
+                    'indices': current_group,
+                    'size': len(current_group)
+                })
+                group_id += 1
+        
+        return duplicate_groups
+
+# Load data
+    print("Loading grouped credit and debit files...")
+    df_credits = credit_file
+    df_debits = debit_file
+
+    print(f"Credits: {len(df_credits)} rows")
+    print(f"Debits: {len(df_debits)} rows")
+
+    # Clean amount columns
+    df_credits['Amount'] = df_credits['Amount'].apply(clean_amount)
+    df_debits['Amount'] = df_debits['Amount'].apply(clean_amount)
+
+    # Find duplicates in credits
+    print("\n=== ANALYZING CREDITS ===")
+    credit_duplicates = find_duplicates(df_credits, max_differences)
+    print(f"Found {len(credit_duplicates)} duplicate groups in credits")
+
+    # Find duplicates in debits
+    print("\n=== ANALYZING DEBITS ===")
+    debit_duplicates = find_duplicates(df_debits, max_differences)
+    print(f"Found {len(debit_duplicates)} duplicate groups in debits")
+
+
+    # Create simple output with just duplicate transactions grouped together
+
+    # Collect all duplicate transactions in order
+    all_duplicate_rows = []
+
+    # Process credit duplicates
+    for group in credit_duplicates:
+        group_rows = []
+        for idx in group['indices']:
+            row = df_credits.iloc[idx].copy()
+            row['Credit/Debit'] = 'CREDIT'
+            row['Indicator']= 'Data Duplicity'
+
+            group_rows.append(row)
+        
+        # Sort by original index to maintain order
+        group_rows.sort(key=lambda x: x.name if hasattr(x, 'name') else 0)
+        all_duplicate_rows.extend(group_rows)
+
+    # Process debit duplicates  
+    for group in debit_duplicates:
+        group_rows = []
+        for idx in group['indices']:
+            row = df_debits.iloc[idx].copy()
+            row['Credit/Debit'] = 'DEBIT'
+            row['Indicator']= 'Data Duplicity'
+
+            group_rows.append(row)
+        
+        # Sort by original index to maintain order
+        group_rows.sort(key=lambda x: x.name if hasattr(x, 'name') else 0)
+        all_duplicate_rows.extend(group_rows)
+
+    # Create DataFrame from duplicate rows
+    # if all_duplicate_rows:
+    #     duplicates_df = pd.DataFrame(all_duplicate_rows)
+        
+    #     # Select only the original columns (remove any extra columns we added)
+    #     original_columns = ['Date', 'Transaction_Type','Description', 'Amount', 'Balance']
+    #     available_columns = [col for col in original_columns if col in duplicates_df.columns]
+        
+    #     # Save simple output
+    #     duplicates_df[available_columns].to_excel(output_file, index=False)
+    #     print(f"Saved {len(duplicates_df)} duplicate transactions to {output_file}")
+    # else:
+    #     print("No duplicate transactions found")
+
+
+    print(f"\n=== SUMMARY ===")
+    print(f"Credit duplicate groups: {len(credit_duplicates)}")
+    print(f"Debit duplicate groups: {len(debit_duplicates)}")
+    print(f"Total duplicate transactions: {len(all_duplicate_rows)}")
+    all_duplicate_df =pd.DataFrame(all_duplicate_rows)
+
+    header_row = pd.DataFrame([{
+                    'Indicator':'','Date': '', 'Credit/Debit': '', 'Description': '', 'Amount': '', 'Balance': ''
+                }])
+
+                # reorder cols to match
+    cols = ['Indicator', 'Date', 'Credit/Debit', 'Description', 'Amount', 'Balance']
+    all_duplicate_rows = all_duplicate_df[cols]
+
+    dup_df = pd.concat([header_row, all_duplicate_rows], ignore_index=True)
+    
+    all_dup_rows = pd.DataFrame(dup_df)
+
+    return all_dup_rows
+
+
+def generate_fraud_sheet(transactions_df, duplicates_df):
+
+    df_credits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'CREDIT'].copy()
+    df_debits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'DEBIT'].copy()
+
+    
+# ---------- CONFIG ----------
+    # credit_file = recurring_credit_df
+    # debit_file = recurring_debit_df
+    duplicates_file = duplicates_df
+    # ----------------------------
+
+
+    def analyze_data_duplicity():
+        """Analyze data duplicity from the duplicates file"""
+        try:
+            df_duplicates = pd.read_excel(duplicates_file)
+            
+            # Count duplicates by transaction type
+            credit_duplicates = len(df_duplicates[df_duplicates['Transaction_Type'] == 'CREDIT'])
+            debit_duplicates = len(df_duplicates[df_duplicates['Transaction_Type'] == 'DEBIT'])
+            
+            # Analyze duplicate patterns
+            duplicate_analysis = {
+                'Total_Duplicate_Transactions': len(df_duplicates),
+                'Credit_Duplicates': credit_duplicates,
+                'Debit_Duplicates': debit_duplicates,
+                'Duplicate_Percentage': (len(df_duplicates) / (270 * 2)) * 100,  # 270 rows each for credit and debit
+                'Status': 'YES' if len(df_duplicates) > 0 else 'NO'
+            }
+            
+            return duplicate_analysis
+        except Exception as e:
+            return {
+                'Total_Duplicate_Transactions': 0,
+                'Credit_Duplicates': 0,
+                'Debit_Duplicates': 0,
+                'Duplicate_Percentage': 0,
+                'Status': 'NO',
+                'Error': str(e)
+            }
+
+    def analyze_balance_reconciliation(transactions_df):
+        """Analyze balance reconciliation issues"""
+
+        df_credits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'CREDIT'].copy()
+        df_debits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'DEBIT'].copy()
+
+        credit_amounts = pd.to_numeric(df_credits['Amount'].astype(str).str.replace(',', ''), errors='coerce')
+        debit_amounts = pd.to_numeric(df_debits['Amount'].astype(str).str.replace(',', ''), errors='coerce')
+        
+        credit_total = credit_amounts.sum() if 'Amount' in df_credits.columns else 0
+        debit_total = debit_amounts.sum() if 'Amount' in df_debits.columns else 0
+        
+        balance_diff = abs(credit_total - debit_total)
+        balance_diff_percentage = (balance_diff / max(credit_total, debit_total)) * 100 if max(credit_total, debit_total) > 0 else 0
+        
+        return {
+            'Credit_Total': credit_total,
+            'Debit_Total': debit_total,
+            'Difference': balance_diff,
+            'Difference_Percentage': balance_diff_percentage,
+            'Status': 'YES' if balance_diff_percentage > 1 else 'NO'  # Flag if difference > 1%
+        }
+
+    def analyze_equal_debit_credit(transactions_df):
+        """Analyze equal debit and credit transactions"""
+        # Look for transactions with same amount on same day
+        equal_transactions = 0
+
+        df_credits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'CREDIT'].copy()
+        df_debits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'DEBIT'].copy()
+
+        
+        for _, credit_row in df_credits.iterrows():
+            credit_amount = pd.to_numeric(str(credit_row['Amount']).replace(',', ''), errors='coerce')
+            credit_date = credit_row.get('Date', '')
+            
+            if pd.notna(credit_amount) and credit_date:
+                # Look for matching debit amount on same date
+                matching_debits = df_debits[
+                    (pd.to_numeric(df_debits['Amount'].astype(str).str.replace(',', ''), errors='coerce') == credit_amount) &
+                    (df_debits['Date'] == credit_date)
+                ]
+                equal_transactions += len(matching_debits)
+        
+        return {
+            'Equal_Transactions': equal_transactions,
+            'Status': 'YES' if equal_transactions > 0 else 'NO'
+        }
+
+    def analyze_suspected_income_infusion(transactions_df):
+        """Analyze suspected income infusion patterns"""
+        # Look for unusually large credit amounts
+        df_credits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'CREDIT'].copy()
+
+        credit_amounts = pd.to_numeric(df_credits['Amount'].astype(str).str.replace(',', ''), errors='coerce').dropna()
+        
+        if len(credit_amounts) > 0:
+            # Define threshold as 95th percentile
+            threshold = credit_amounts.quantile(0.95)
+            large_credits = len(credit_amounts[credit_amounts > threshold])
+            
+            return {
+                'Large_Credits': large_credits,
+                'Threshold': threshold,
+                'Status': 'YES' if large_credits > 5 else 'NO'
+            }
+        
+        return {'Large_Credits': 0, 'Threshold': 0, 'Status': 'NO'}
+
+    def analyze_negative_eod_balance(transactions_df):
+        """Analyze negative end-of-day balances"""
+        df_credits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'CREDIT'].copy()
+        df_debits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'DEBIT'].copy()
+
+        if 'Balance' in df_credits.columns:
+            credit_balances = pd.to_numeric(df_credits['Balance'].astype(str).str.replace(',', ''), errors='coerce')
+            credit_negative = len(credit_balances[credit_balances < 0])
+        else:
+            credit_negative = 0
+            
+        if 'Balance' in df_debits.columns:
+            debit_balances = pd.to_numeric(df_debits['Balance'].astype(str).str.replace(',', ''), errors='coerce')
+            debit_negative = len(debit_balances[debit_balances < 0])
+        else:
+            debit_negative = 0
+        
+        return {
+            'Credit_Negative': credit_negative,
+            'Debit_Negative': debit_negative,
+            'Total_Negative': credit_negative + debit_negative,
+            'Status': 'YES' if (credit_negative + debit_negative) > 0 else 'NO'
+        }
+
+    def analyze_bank_holidays_transactions(transactions_df):
+        """Analyze transactions on bank holidays"""
+        # Get Indian bank holidays for 2024
+        india_holidays = holidays.India(years=2024)
+        
+        holiday_transactions = 0
+        df_credits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'CREDIT'].copy()
+        df_debits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'DEBIT'].copy()
+
+        
+        for df in [df_credits, df_debits]:
+            for _, row in df.iterrows():
+                date_str = row.get('Date', '')
+                if date_str:
+                    try:
+                        # Parse date
+                        if '/' in date_str:
+                            date_obj = datetime.strptime(date_str, '%d/%m/%Y').date()
+                        else:
+                            date_obj = pd.to_datetime(date_str).date()
+                        
+                        if date_obj in india_holidays:
+                            holiday_transactions += 1
+                    except:
+                        continue
+        
+        return {
+            'Holiday_Transactions': holiday_transactions,
+            'Status': 'YES' if holiday_transactions > 0 else 'NO'
+        }
+
+    def analyze_suspicious_rtgs(transactions_df):
+        """Analyze suspicious RTGS transactions"""
+        df_credits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'CREDIT'].copy()
+        df_debits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'DEBIT'].copy()
+
+        rtgs_credits = len(df_credits[df_credits['Description'].str.contains('RTGS', case=False, na=False)])
+        rtgs_debits = len(df_debits[df_debits['Description'].str.contains('RTGS', case=False, na=False)])
+        
+        # Look for RTGS transactions with unusual amounts or patterns
+        suspicious_rtgs = 0
+        
+        for df in [df_credits, df_debits]:
+            rtgs_transactions = df[df['Description'].str.contains('RTGS', case=False, na=False)]
+            amounts = pd.to_numeric(rtgs_transactions['Amount'].astype(str).str.replace(',', ''), errors='coerce')
+            
+            # Flag RTGS transactions below 2 lakhs (RTGS minimum)
+            low_rtgs = len(amounts[amounts < 200000])
+            suspicious_rtgs += low_rtgs
+        
+        return {
+            'RTGS_Credits': rtgs_credits,
+            'RTGS_Debits': rtgs_debits,
+            'Suspicious_Low_RTGS': suspicious_rtgs,
+            'Status': 'YES' if suspicious_rtgs > 0 else 'NO'
+        }
+
+    def analyze_suspicious_tax_payments(transactions_df):
+        """Analyze suspicious tax payments (SGST/CGST patterns)"""
+        tax_patterns = ['SGST', 'CGST', 'IGST', 'GST']
+        suspicious_tax = 0
+        suspicious_txns = []
+
+        df_credits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'CREDIT'].copy()
+        df_debits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'DEBIT'].copy()
+        for df in [df_credits, df_debits]:
+            for pattern in tax_patterns:
+                cols_to_keep = ['Date', 'Credit/Debit', 'Description', 'Amount', 'Balance']
+
+                tax_transactions = df.loc[df['Description'].str.contains(pattern, case=False, na=False), cols_to_keep].copy()
+                if not tax_transactions.empty:
+                    tax_transactions['Indicator'] = 'Suspicious Transactions'
+
+                    suspicious_txns.append(tax_transactions)
+                
+                # Group by date and amount to find potential duplicates
+                if len(tax_transactions) > 0:
+                    grouped = tax_transactions.groupby(['Date', 'Amount']).size()
+                    duplicate_tax = len(grouped[grouped > 1])
+                    suspicious_tax += duplicate_tax
+        suspicious_txns_df = pd.concat(suspicious_txns, ignore_index=True) if suspicious_txns else pd.DataFrame()
+        return {
+            'Suspicious_Tax_Payments': suspicious_tax,
+            'Status': 'YES' if suspicious_tax > 0 else 'NO',
+            'Transactions': suspicious_txns_df
+        }
+
+    def analyze_irregular_credit_card_payments(transactions_df):
+        """Analyze irregular credit card payment patterns"""
+        cc_keywords = ['CREDIT CARD', 'CC PAYMENT', 'CARD PAYMENT', 'VISA', 'MASTERCARD']
+        cc_transactions = 0
+        irregular_patterns = 0
+        df_credits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'CREDIT'].copy()
+        df_debits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'DEBIT'].copy()
+
+        
+        for df in [df_credits, df_debits]:
+            for keyword in cc_keywords:
+                cc_txns = df[df['Description'].str.contains(keyword, case=False, na=False)]
+                cc_transactions += len(cc_txns)
+                
+                # Look for irregular amounts (non-round numbers for CC payments)
+                amounts = pd.to_numeric(cc_txns['Amount'].astype(str).str.replace(',', ''), errors='coerce')
+                non_round = len(amounts[amounts % 100 != 0])  # Not multiples of 100
+                irregular_patterns += non_round
+        
+        return {
+            'CC_Transactions': cc_transactions,
+            'Irregular_CC_Patterns': irregular_patterns,
+            'Status': 'YES' if irregular_patterns > 10 else 'NO'
+        }
+
+    def analyze_irregular_salary_credits(transactions_df):
+        """Analyze irregular salary credit patterns"""
+        salary_keywords = ['SALARY', 'SAL', 'PAYROLL', 'WAGES']
+        salary_transactions = 0
+        irregular_salary = 0
+        df_credits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'CREDIT'].copy()
+
+        for keyword in salary_keywords:
+            salary_txns = df_credits[df_credits['Description'].str.contains(keyword, case=False, na=False)]
+            salary_transactions += len(salary_txns)
+            
+            # Look for salary credits on non-month-end dates
+            if len(salary_txns) > 0:
+                for _, row in salary_txns.iterrows():
+                    date_str = row.get('Date', '')
+                    if date_str:
+                        try:
+                            if '/' in date_str:
+                                date_obj = datetime.strptime(date_str, '%d/%m/%Y')
+                            else:
+                                date_obj = pd.to_datetime(date_str)
+                            
+                            # Check if not on month-end (last 3 days of month)
+                            if date_obj.day < 28:
+                                irregular_salary += 1
+                        except:
+                            continue
+        
+        return {
+            'Salary_Transactions': salary_transactions,
+            'Irregular_Salary_Dates': irregular_salary,
+            'Status': 'YES' if irregular_salary > 0 else 'NO'
+        }
+
+    def analyze_unchanged_salary_credit_amount(transactions_df):
+        """Analyze unchanged salary credit amounts"""
+        salary_keywords = ['SALARY', 'SAL', 'PAYROLL']
+        salary_amounts = []
+        df_credits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'CREDIT'].copy()
+
+        for keyword in salary_keywords:
+            salary_txns = df_credits[df_credits['Description'].str.contains(keyword, case=False, na=False)]
+            amounts = pd.to_numeric(salary_txns['Amount'].astype(str).str.replace(',', ''), errors='coerce').dropna()
+            salary_amounts.extend(amounts.tolist())
+        
+        if len(salary_amounts) > 1:
+            # Check for unchanged amounts
+            unique_amounts = len(set(salary_amounts))
+            unchanged_percentage = (len(salary_amounts) - unique_amounts) / len(salary_amounts) * 100
+            
+            return {
+                'Total_Salary_Transactions': len(salary_amounts),
+                'Unique_Amounts': unique_amounts,
+                'Unchanged_Percentage': unchanged_percentage,
+                'Status': 'YES' if unchanged_percentage > 80 else 'NO'
+            }
+        
+        return {'Total_Salary_Transactions': 0, 'Unique_Amounts': 0, 'Unchanged_Percentage': 0, 'Status': 'NO'}
+
+    def analyze_irregular_transfers_to_parties(transactions_df):
+        """Analyze irregular transfers to external parties"""
+        # Look for transfers to external parties with unusual patterns
+        party_keywords = ['TRANSFER', 'NEFT', 'IMPS', 'TO']
+        suspicious_transfers = 0
+        df_credits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'CREDIT'].copy()
+        df_debits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'DEBIT'].copy()
+        
+        for df in [df_credits, df_debits]:
+            for keyword in party_keywords:
+                transfers = df[df['Description'].str.contains(keyword, case=False, na=False)]
+                
+                # Look for transfers with unusual amounts or timing
+                amounts = pd.to_numeric(transfers['Amount'].astype(str).str.replace(',', ''), errors='coerce').dropna()
+                
+                # Flag transfers above certain threshold
+                high_transfers = len(amounts[amounts > 100000])  # Above 1 lakh
+                suspicious_transfers += high_transfers
+        
+        return {
+            'Suspicious_Transfers': suspicious_transfers,
+            'Status': 'YES' if suspicious_transfers > 20 else 'NO'
+        }
+
+    def analyze_irregular_interest_charges(transactions_df):
+        """Analyze irregular interest charges"""
+        interest_keywords = ['INTEREST', 'INT', 'CHARGES', 'PENALTY']
+        interest_transactions = 0
+        irregular_interest = 0
+        df_debits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'DEBIT'].copy()
+        for keyword in interest_keywords:
+            interest_txns = df_debits[df_debits['Description'].str.contains(keyword, case=False, na=False)]
+            interest_transactions += len(interest_txns)
+            
+            # Look for unusually high interest charges
+            amounts = pd.to_numeric(interest_txns['Amount'].astype(str).str.replace(',', ''), errors='coerce').dropna()
+            high_interest = len(amounts[amounts > 10000])  # Above 10k
+            irregular_interest += high_interest
+        
+        return {
+            'Interest_Transactions': interest_transactions,
+            'High_Interest_Charges': irregular_interest,
+            'Status': 'YES' if irregular_interest > 5 else 'NO'
+        }
+
+    def analyze_decimals_in_atm_withdrawal(transactions_df):
+        """Analyze decimals in ATM withdrawal amounts"""
+        atm_keywords = ['ATM', 'CASH WITHDRAWAL', 'WITHDRAWAL']
+        atm_transactions = 0
+        decimal_atm = 0
+        df_debits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'DEBIT'].copy()
+        for keyword in atm_keywords:
+            atm_txns = df_debits[df_debits['Description'].str.contains(keyword, case=False, na=False)]
+            atm_transactions += len(atm_txns)
+            
+            # Look for ATM withdrawals with decimal amounts (unusual)
+            amounts = pd.to_numeric(atm_txns['Amount'].astype(str).str.replace(',', ''), errors='coerce').dropna()
+            decimal_amounts = len(amounts[amounts % 1 != 0])  # Not whole numbers
+            decimal_atm += decimal_amounts
+        
+        return {
+            'ATM_Transactions': atm_transactions,
+            'Decimal_ATM_Amounts': decimal_atm,
+            'Status': 'YES' if decimal_atm > 0 else 'NO'
+        }
+
+    def analyze_high_withdrawal(transactions_df):
+        """Analyze high withdrawal amounts"""
+        withdrawal_keywords = ['WITHDRAWAL', 'ATM', 'CASH']
+        high_withdrawals = 0
+
+        df_debits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'DEBIT'].copy()
+
+        for keyword in withdrawal_keywords:
+            withdrawals = df_debits[df_debits['Description'].str.contains(keyword, case=False, na=False)]
+            amounts = pd.to_numeric(withdrawals['Amount'].astype(str).str.replace(',', ''), errors='coerce').dropna()
+            
+            # Flag withdrawals above 50k (high amount)
+            high_amounts = len(amounts[amounts > 50000])
+            high_withdrawals += high_amounts
+        
+        return {
+            'High_Withdrawals': high_withdrawals,
+            'Status': 'YES' if high_withdrawals > 10 else 'NO'
+        }
+
+    def analyze_nonexistent_date(transactions_df):
+        """Analyze transactions with non-existent dates"""
+        invalid_dates = 0
+        df_credits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'CREDIT'].copy()
+        df_debits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'DEBIT'].copy()
+
+        for df in [df_credits, df_debits]:
+            for _, row in df.iterrows():
+                date_str = row.get('Date', '')
+                if date_str:
+                    try:
+                        if '/' in date_str:
+                            datetime.strptime(date_str, '%d/%m/%Y')
+                        else:
+                            pd.to_datetime(date_str)
+                    except:
+                        invalid_dates += 1
+        
+        return {
+            'Invalid_Dates': invalid_dates,
+            'Status': 'YES' if invalid_dates > 0 else 'NO'
+        }
+
+    def analyze_duplicate_reference_number(transactions_df):
+        """Analyze duplicate reference numbers"""
+        all_refs = []
+
+        df_credits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'CREDIT'].copy()
+        df_debits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'DEBIT'].copy()
+
+        
+        for df in [df_credits, df_debits]:
+            # Look for reference numbers in descriptions
+            for _, row in df.iterrows():
+                desc = str(row.get('Description', ''))
+                # Extract potential reference numbers (alphanumeric patterns)
+                import re
+                refs = re.findall(r'[A-Z0-9]{8,}', desc)
+                all_refs.extend(refs)
+        
+        # Count duplicates
+        ref_counts = pd.Series(all_refs).value_counts()
+        duplicate_refs = len(ref_counts[ref_counts > 1])
+        
+        return {
+            'Total_References': len(all_refs),
+            'Duplicate_References': duplicate_refs,
+            'Status': 'YES' if duplicate_refs > 5 else 'NO'
+        }
+
+    def analyze_font_mismatch(transactions_df):
+        """Analyze font mismatch in descriptions (placeholder - would need OCR analysis)"""
+        # This would typically require OCR analysis of scanned documents
+        # For now, we'll look for unusual character patterns
+        
+        font_issues = 0
+        df_credits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'CREDIT'].copy()
+        df_debits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'DEBIT'].copy()
+
+        
+        for df in [df_credits, df_debits]:
+            for _, row in df.iterrows():
+                desc = str(row.get('Description', ''))
+                
+                # Look for mixed character sets (basic check)
+                has_ascii = any(ord(c) < 128 for c in desc)
+                has_non_ascii = any(ord(c) >= 128 for c in desc)
+                
+                if has_ascii and has_non_ascii:
+                    # Count unusual character combinations
+                    if len(set(desc)) / len(desc) < 0.3:  # Low character diversity
+                        font_issues += 1
+        
+        return {
+            'Font_Mismatch_Issues': font_issues,
+            'Status': 'YES' if font_issues > 10 else 'NO'
+        }
+
+    def generate_comprehensive_fraud_summary(transactions_df):
+        """Generate comprehensive fraud detection summary with all indicators"""
+        print("Loading data files...")
+
+        print("Analyzing comprehensive fraud patterns...")
+        
+        # Perform all analyses
+        duplicity_analysis = analyze_data_duplicity()
+        balance_analysis = analyze_balance_reconciliation(transactions_df)
+        equal_debit_credit = analyze_equal_debit_credit(transactions_df)
+        income_infusion = analyze_suspected_income_infusion(transactions_df)
+        negative_balance = analyze_negative_eod_balance(transactions_df)
+        bank_holidays = analyze_bank_holidays_transactions(transactions_df)
+        suspicious_rtgs = analyze_suspicious_rtgs(transactions_df)
+        tax_payments = analyze_suspicious_tax_payments(transactions_df)
+        cc_payments = analyze_irregular_credit_card_payments(transactions_df)
+        salary_credits = analyze_irregular_salary_credits(transactions_df)
+        unchanged_salary = analyze_unchanged_salary_credit_amount(transactions_df)
+        transfers_parties = analyze_irregular_transfers_to_parties(transactions_df)
+        interest_charges = analyze_irregular_interest_charges(transactions_df)
+        atm_decimals = analyze_decimals_in_atm_withdrawal(transactions_df)
+        high_withdrawal = analyze_high_withdrawal(transactions_df)
+        nonexistent_date = analyze_nonexistent_date(transactions_df)
+        duplicate_refs = analyze_duplicate_reference_number(transactions_df)
+        font_mismatch = analyze_font_mismatch(transactions_df)
+        
+        # Create comprehensive summary dataframe
+        summary_data = [
+            {
+                'Fraud_Indicator': 'Balance Reconciliation',
+                'Identified': balance_analysis['Status'],
+                'Description': f"Credit total: ₹{balance_analysis['Credit_Total']:,.2f}, Debit total: ₹{balance_analysis['Debit_Total']:,.2f}. Difference: ₹{balance_analysis['Difference']:,.2f} ({balance_analysis['Difference_Percentage']:.2f}%)"
+            },
+            {
+                'Fraud_Indicator': 'Equal Debit Credit',
+                'Identified': equal_debit_credit['Status'],
+                'Description': f"Found {equal_debit_credit['Equal_Transactions']} transactions with equal debit and credit amounts on same date"
+            },
+            {
+                'Fraud_Indicator': 'Suspected Income Infusion',
+                'Identified': income_infusion['Status'],
+                'Description': f"Found {income_infusion['Large_Credits']} large credit transactions above ₹{income_infusion['Threshold']:,.2f}"
+            },
+            {
+                'Fraud_Indicator': 'Negative EOD Balance',
+                'Identified': negative_balance['Status'],
+                'Description': f"Found {negative_balance['Total_Negative']} transactions with negative balances. Credit: {negative_balance['Credit_Negative']}, Debit: {negative_balance['Debit_Negative']}"
+            },
+            {
+                'Fraud_Indicator': 'Transactions on Bank Holidays',
+                'Identified': bank_holidays['Status'],
+                'Description': f"Found {bank_holidays['Holiday_Transactions']} transactions on bank holidays"
+            },
+            {
+                'Fraud_Indicator': 'Suspicious RTGS Transactions',
+                'Identified': suspicious_rtgs['Status'],
+                'Description': f"Found {suspicious_rtgs['Suspicious_Low_RTGS']} suspicious RTGS transactions. Total RTGS: Credit {suspicious_rtgs['RTGS_Credits']}, Debit {suspicious_rtgs['RTGS_Debits']}"
+            },
+            {
+                'Fraud_Indicator': 'Suspicious Tax Payments',
+                'Identified': tax_payments['Status'],
+                'Description': f"Found {tax_payments['Suspicious_Tax_Payments']} suspicious tax payment patterns",
+            },
+            {
+                'Fraud_Indicator': 'Irregular Credit Card Payments',
+                'Identified': cc_payments['Status'],
+                'Description': f"Found {cc_payments['Irregular_CC_Patterns']} irregular credit card payment patterns out of {cc_payments['CC_Transactions']} CC transactions"
+            },
+            {
+                'Fraud_Indicator': 'Irregular Salary Credits',
+                'Identified': salary_credits['Status'],
+                'Description': f"Found {salary_credits['Irregular_Salary_Dates']} salary credits on irregular dates out of {salary_credits['Salary_Transactions']} salary transactions"
+            },
+            {
+                'Fraud_Indicator': 'Unchanged Salary Credit Amount',
+                'Identified': unchanged_salary['Status'],
+                'Description': f"Found {unchanged_salary['Unchanged_Percentage']:.1f}% unchanged salary amounts out of {unchanged_salary['Total_Salary_Transactions']} salary transactions"
+            },
+            {
+                'Fraud_Indicator': 'Irregular Transfers to Parties',
+                'Identified': transfers_parties['Status'],
+                'Description': f"Found {transfers_parties['Suspicious_Transfers']} suspicious high-value transfers to external parties"
+            },
+            {
+                'Fraud_Indicator': 'Data Duplicity',
+                'Identified': duplicity_analysis['Status'],
+                'Description': f"Found {duplicity_analysis['Total_Duplicate_Transactions']} duplicate transactions ({duplicity_analysis['Duplicate_Percentage']:.1f}% of total). Credit: {duplicity_analysis['Credit_Duplicates']}, Debit: {duplicity_analysis['Debit_Duplicates']}"
+            },
+            {
+                'Fraud_Indicator': 'Irregular Interest Charges',
+                'Identified': interest_charges['Status'],
+                'Description': f"Found {interest_charges['High_Interest_Charges']} high interest charges out of {interest_charges['Interest_Transactions']} interest transactions"
+            },
+            {
+                'Fraud_Indicator': 'Decimals in ATM Withdrawal',
+                'Identified': atm_decimals['Status'],
+                'Description': f"Found {atm_decimals['Decimal_ATM_Amounts']} ATM withdrawals with decimal amounts out of {atm_decimals['ATM_Transactions']} ATM transactions"
+            },
+            {
+                'Fraud_Indicator': 'High Withdrawal',
+                'Identified': high_withdrawal['Status'],
+                'Description': f"Found {high_withdrawal['High_Withdrawals']} high-value withdrawals above ₹50,000"
+            },
+            {
+                'Fraud_Indicator': 'Non Existent Date',
+                'Identified': nonexistent_date['Status'],
+                'Description': f"Found {nonexistent_date['Invalid_Dates']} transactions with invalid/non-existent dates"
+            },
+            {
+                'Fraud_Indicator': 'Duplicate Reference Number',
+                'Identified': duplicate_refs['Status'],
+                'Description': f"Found {duplicate_refs['Duplicate_References']} duplicate reference numbers out of {duplicate_refs['Total_References']} total references"
+            },
+            {
+                'Fraud_Indicator': 'Font Mismatch',
+                'Identified': font_mismatch['Status'],
+                'Description': f"Found {font_mismatch['Font_Mismatch_Issues']} potential font mismatch issues in transaction descriptions"
+            }
+        ]
+        
+        # Create summary dataframe
+        
+        summary_df = pd.DataFrame(summary_data)
+        
+
+        tax_txns_df = tax_payments['Transactions']
+        if not tax_txns_df.empty:
+            # Add a header row as separator
+                header_row = pd.DataFrame([{
+                    'Indicator':'','Date': '', 'Credit/Debit': '', 'Description': '', 'Amount': '', 'Balance': ''
+                }])
+
+                # reorder cols to match
+                cols = ['Indicator', 'Date', 'Credit/Debit', 'Description', 'Amount', 'Balance']
+                tax_txns_df = tax_txns_df[cols]
+
+                details_df = pd.concat([header_row, tax_txns_df], ignore_index=True)
+        else:
+            details_df = pd.DataFrame()
+        # Save results
+        
+        # with pd.ExcelWriter(output_file) as writer:
+        #     # Main summary
+        #     summary_df.to_excel(writer, sheet_name='Fraud_Summary', index=False)
+            
+        #     # Detailed duplicate transactions
+        #     try:
+        #         df_duplicates = pd.read_excel(duplicates_file)
+        #         df_duplicates.to_excel(writer, sheet_name='Duplicate_Transactions', index=False)
+        #     except:
+        #         pass
+            
+        #     # All transactions with flags
+        #     # df_credits_all = df_credits.copy()
+        #     # df_credits_all['Transaction_Type'] = 'CREDIT'
+        #     # df_debits_all = df_debits.copy()
+        #     # df_debits_all['Transaction_Type'] = 'DEBIT'
+            
+        #     # all_transactions = pd.concat([df_credits_all, df_debits_all], ignore_index=True)
+        #     # all_transactions.to_excel(writer, sheet_name='All_Transactions', index=False)
+        
+        print(f"\n=== COMPREHENSIVE FRAUD DETECTION SUMMARY ===")
+        
+        # Count flagged indicators
+        # flagged_count = len(summary_df[summary_df['Identified'] == 'YES'])
+        # print(f"\nTotal Fraud Indicators Flagged: {flagged_count} out of {len(summary_df)}")
+        
+        return (summary_df, details_df)
+
+# if __name__ == "__main__":
+    # summary = generate_comprehensive_fraud_summary()
+    fraud_summary_df= generate_comprehensive_fraud_summary(transactions_df)
+
+    return fraud_summary_df
 
 
 def generate_summary_sheet(normalized_file, output_file):
@@ -694,6 +1565,10 @@ def generate_summary_sheet(normalized_file, output_file):
     print("[INFO] Generating Recurring Debit Details...")
     recurring_debit_df = generate_recurring_credit_debit(transactions_df.copy(), val='DEBIT')
     
+    print("[INFO] Generating Fraud Sheet Details...")
+    duplicates_df = generate_duplicates(recurring_credit_df , recurring_debit_df)
+    fraud_sheet_df,sus_txns_df = generate_fraud_sheet(transactions_df.copy(), duplicates_df)
+    
     
     # Save to Excel
     with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
@@ -706,7 +1581,14 @@ def generate_summary_sheet(normalized_file, output_file):
         if not recurring_credit_df.empty:
             recurring_credit_df.to_excel(writer, index=False, sheet_name='Recurring Credit')  
         if not recurring_debit_df.empty:
-            recurring_debit_df.to_excel(writer, index=False, sheet_name='Recurring Debit')      
+            recurring_debit_df.to_excel(writer, index=False, sheet_name='Recurring Debit')
+        # if not duplicates_df.empty:
+        #     duplicates_df.to_excel(writer ,index=False , sheet_name='Duplicates_Fraud_Sheet')      
+        if not fraud_sheet_df.empty:
+            fraud_sheet_df.to_excel(writer, index=False, sheet_name='Fraud Check Sheet', startrow=0)
+            sus_txns_df.to_excel(writer , index=False ,sheet_name='Fraud Check Sheet',startrow=len(fraud_sheet_df)+3 )   
+            if not duplicates_df.empty:
+               duplicates_df.to_excel(writer ,index=False , sheet_name='Fraud Check Sheet', startrow=len(fraud_sheet_df+sus_txns_df))
         transactions_df.to_excel(writer, index=False, sheet_name='Xns')
 
     
