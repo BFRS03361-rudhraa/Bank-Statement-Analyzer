@@ -20,6 +20,8 @@ def parse_transaction_dates(series):
         "%Y-%m-%d",              # 2024-09-02
         "%d-%m-%Y",              # 02-09-2024
         "%d/%m/%y %H:%M:%S",     # 02/09/24 13:01:43
+        "%d-%b-%Y",              # 16-Nov-2024
+        "%d-%B-%Y",              # 16-November-2024
     ]
 
     parsed = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
@@ -40,7 +42,7 @@ def detect_date_column(df):
     """Detect date column by looking for specific patterns like 'date', 'value date', 'txn date'."""
     # First, look for exact matches with common date column names
     date_patterns = [
-       r'txn\s*date', r'transaction\s*date',r'tran\s*date' ,r'txn\s*posted\s*date',  # highest priority
+       r'txn\s*date', r'transaction\s*date',r'tran\s*date' ,r'txn\s*posted\s*date',r'date',  # highest priority
           # generic date last
     ]
     for pattern in date_patterns:
@@ -68,8 +70,11 @@ def normalize_headers(df):
     standard_columns = {
         'Credit/Debit': ['cr/dr','dr/cr', 'cr dr', 'credit debit', 'type', 'transaction type', 'debit credit'],
         'Description': ['description', 'narration', 'particulars', 'details', 'transaction details'],
+        'Credit':['credit', 'credit amount'],
+        'Debit':['debit', 'debit amount'],
         'Amount': ['amount', 'transaction amount', 'transaction value', 'amount(inr)', 'transaction amount(inr)'],
-        'Balance': ['balance', 'available balance', 'running balance', 'closing balance', 'available balance(inr)']
+        'Balance': ['balance', 'available balance', 'running balance', 'closing balance', 'available balance(inr)'],
+        
     }
 
     new_df = df.copy()
@@ -103,6 +108,42 @@ def normalize_headers(df):
             column_mapping[orig_col] = orig_col
 
     new_df = new_df.rename(columns=column_mapping)
+    
+    # Step 2b: Handle separate Debit/Credit columns ONLY if both exist
+    debit_col_candidates = [c for c in new_df.columns if 'debit' in c.lower() and c != 'Credit/Debit']
+    credit_col_candidates = [c for c in new_df.columns if 'credit' in c.lower() and c != 'Credit/Debit']
+
+    if debit_col_candidates and credit_col_candidates:
+        debit_col = debit_col_candidates[0]
+        credit_col = credit_col_candidates[0]
+
+        # Only apply if BOTH columns exist
+        # Safely create Credit/Debit column
+        def get_cd(row):
+            if pd.notna(row[credit_col]) and row[credit_col] != 0:
+                return 'CREDIT'
+            elif pd.notna(row[debit_col]) and row[debit_col] != 0:
+                return 'DEBIT'
+            else:
+                return pd.NA
+
+        new_df['Credit/Debit'] = new_df.apply(get_cd, axis=1)
+
+        # Fill Amount column safely
+        new_df['Amount'] = new_df.apply(
+            lambda row: row[credit_col] 
+                        if pd.notna(row['Credit/Debit']) and row['Credit/Debit'] == 'CREDIT'
+                        else (row[debit_col] 
+                            if pd.notna(row['Credit/Debit']) and row['Credit/Debit'] == 'DEBIT'
+                            else pd.NA),
+            axis=1
+        )
+    else:
+        # Otherwise, keep the original Amount and Credit/Debit columns as they are
+        if 'Amount' not in new_df.columns:
+            # if missing, try to infer from existing columns (optional)
+            pass
+
 
     # ---- Step 3: Reorder columns ----
     final_columns = []
