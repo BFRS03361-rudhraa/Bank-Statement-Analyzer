@@ -6,6 +6,38 @@ from collections import Counter
 from difflib import get_close_matches
 
 
+def clean_amount(value):
+    """
+    Clean financial amount strings:
+    - Keep only numeric value (with sign if present).
+    - Remove currency symbols, CR/DR suffixes, text, commas.
+    """
+    if pd.isna(value):
+        return pd.NA
+
+    val = str(value).strip().upper()
+
+    # Handle explicit CR/DR suffix
+    sign = 1
+    if val.endswith("CR"):
+        sign = 1
+        val = val[:-2]
+    elif val.endswith("DR"):
+        sign = -1
+        val = val[:-2]
+
+    # Remove currency words/symbols
+    val = re.sub(r"[^\d\.\-]", "", val)  # keep only digits, dot, minus
+
+    if val == "" or val == "." or val == "-":
+        return pd.NA
+
+    try:
+        return sign * float(val)
+    except ValueError:
+        return pd.NA
+
+
 def parse_transaction_dates(series):
     """
     Parse a series of transaction date strings using multiple expected formats.
@@ -42,7 +74,7 @@ def detect_date_column(df):
     """Detect date column by looking for specific patterns like 'date', 'value date', 'txn date'."""
     # First, look for exact matches with common date column names
     date_patterns = [
-       r'txn\s*date', r'transaction\s*date',r'tran\s*date' ,r'txn\s*posted\s*date',r'date',  # highest priority
+       r'txn\s*date', r'transaction\s*date',r'tran\s*date' ,r'txn\s*posted\s*date',r'post\s*date' ,r'date',  # highest priority
           # generic date last
     ]
     for pattern in date_patterns:
@@ -70,8 +102,8 @@ def normalize_headers(df):
     standard_columns = {
         'Credit/Debit': ['cr/dr','dr/cr', 'cr dr', 'credit debit', 'type', 'transaction type', 'debit credit'],
         'Description': ['description', 'narration', 'particulars', 'details', 'transaction details'],
-        'Credit':['credit', 'credit amount'],
-        'Debit':['debit', 'debit amount'],
+        'Credit':['credit', 'credit amount', 'desposit', 'cr'],
+        'Debit':['debit', 'debit amount','withdrawal', 'dr'],
         'Amount': ['amount', 'transaction amount', 'transaction value', 'amount(inr)', 'transaction amount(inr)'],
         'Balance': ['balance', 'available balance', 'running balance', 'closing balance', 'available balance(inr)'],
         
@@ -168,6 +200,10 @@ def normalize_headers(df):
             'D': 'DEBIT',
             'C': 'CREDIT'
         })
+
+    for col in ['Credit', 'Debit', 'Amount', 'Balance']:
+        if col in new_df.columns:
+            new_df[col] = new_df[col].apply(clean_amount)
 
     return new_df
 
