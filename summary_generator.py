@@ -586,6 +586,92 @@ def generate_recurring_credit_debit(transactions_df, val):
 
     print(f"Grouped credit transactions saved to {output_file}")
 
+def generate_return_txn(transactions_df):
+    return_keywords = [
+        "RETURN",
+        "ACCOUNT DOES NOT EXIST",
+        "INCORRECT ACCOUNT NUMBER",
+        "PAYMENT STOPPED",
+        "Closed Account"
+    ]
+
+    columns = ['Date', 'Amount', 'Balance', 'Description', 
+           'mode', 'category', 'category_2', 'Fund', 'bounce']
+
+    def detect_mode(Description):
+        desc = str(Description).upper()
+        if "NEFT" in desc:
+            return "NEFT"
+        elif "RTGS" in desc:
+            return "RTGS"
+        else:
+            return "Other"
+    # Read transactions
+    df=transactions_df
+    # Ensure description is string
+    df['Description'] = df['Description'].astype(str)
+
+    # Flag return transactions
+    df['is_return'] = df['Description'].str.upper().str.contains("|".join(return_keywords))
+
+    # Separate original transactions and returns
+    original_txns = df[~df['is_return']].copy().reset_index(drop=True)
+    return_txns = df[df['is_return']].copy().reset_index(drop=True)
+
+    # Track which return transactions have been matched
+    return_txns['matched'] = False
+
+    return_txn_rows = []
+
+    for idx, orig in original_txns.iterrows():
+        # Try to find a matching return transaction
+        # Match by amount (and optionally by mode/type if available)
+        matched = return_txns[
+            (~return_txns['matched']) &
+            (return_txns['Amount'] == orig['Amount']) & (return_txns['Date'] == orig['Date'])
+        ]
+        
+        if not matched.empty:
+            # Found a matching return
+            ret = matched.iloc[0]
+            return_txns.at[ret.name, 'matched'] = True  # mark as used
+
+            # Add original transaction row
+            orig_row = {
+                'Date': orig['Date'],
+                'Amount': orig['Amount'],
+                'Balance': orig['Balance'],
+                'Description': orig['Description'],
+                'mode': detect_mode(orig['Description']),
+                'category': 'Payments',
+                'category_2': None,
+                'Fund': 'FUND SUFFICIENT',
+                'bounce': 'Inward Return'
+            }
+            return_txn_rows.append(orig_row)
+
+            # Add return transaction row
+            return_row = {
+                'Date': ret['Date'],
+                'Amount': ret['Amount'],
+                'Balance': ret['Balance'],
+                'Description': ret['Description'],
+                'mode': detect_mode(ret['Description']),
+                'category': 'Return',
+                'category_2': None,
+                'Fund': 'FUND SUFFICIENT',
+                'bounce': 'Inward Return'
+            }
+            return_txn_rows.append(return_row)
+
+    # Convert to DataFrame and save
+    return_txn_df = pd.DataFrame(return_txn_rows, columns=columns)
+    if not return_txn_df.empty:
+        return_df = return_txn_df
+    else: 
+        return_df = pd.DataFrame()
+    return return_df
+
 def generate_duplicates(recurring_credit_df , recurring_debit_df):
 
     credit_file = recurring_credit_df
@@ -800,6 +886,10 @@ def generate_duplicates(recurring_credit_df , recurring_debit_df):
 
                 # reorder cols to match
     cols = ['Indicator', 'Date', 'Credit/Debit', 'Description', 'Amount', 'Balance']
+    if all_duplicate_df.empty:
+        print("[INFO] No duplicates found. Returning empty DataFrame.")
+        return pd.DataFrame(columns=["Indicator", "Date", "Credit/Debit", 
+                                     "Description", "Amount", "Balance"])
     all_duplicate_rows = all_duplicate_df[cols]
 
     dup_df = pd.concat([header_row, all_duplicate_rows], ignore_index=True)
@@ -1418,41 +1508,56 @@ def generate_fraud_sheet(transactions_df, duplicates_df):
                 details_df = pd.concat([header_row, tax_txns_df], ignore_index=True)
         else:
             details_df = pd.DataFrame()
-        # Save results
-        
-        # with pd.ExcelWriter(output_file) as writer:
-        #     # Main summary
-        #     summary_df.to_excel(writer, sheet_name='Fraud_Summary', index=False)
-            
-        #     # Detailed duplicate transactions
-        #     try:
-        #         df_duplicates = pd.read_excel(duplicates_file)
-        #         df_duplicates.to_excel(writer, sheet_name='Duplicate_Transactions', index=False)
-        #     except:
-        #         pass
-            
-        #     # All transactions with flags
-        #     # df_credits_all = df_credits.copy()
-        #     # df_credits_all['Transaction_Type'] = 'CREDIT'
-        #     # df_debits_all = df_debits.copy()
-        #     # df_debits_all['Transaction_Type'] = 'DEBIT'
-            
-        #     # all_transactions = pd.concat([df_credits_all, df_debits_all], ignore_index=True)
-        #     # all_transactions.to_excel(writer, sheet_name='All_Transactions', index=False)
         
         print(f"\n=== COMPREHENSIVE FRAUD DETECTION SUMMARY ===")
-        
-        # Count flagged indicators
-        # flagged_count = len(summary_df[summary_df['Identified'] == 'YES'])
-        # print(f"\nTotal Fraud Indicators Flagged: {flagged_count} out of {len(summary_df)}")
-        
+       
         return (summary_df, details_df)
 
-# if __name__ == "__main__":
-    # summary = generate_comprehensive_fraud_summary()
     fraud_summary_df= generate_comprehensive_fraud_summary(transactions_df)
 
     return fraud_summary_df
+
+def generate_xns_sheet(transactions_df):
+
+    def detect_mode(description):
+        desc = str(description).upper()
+        if "NEFT" in desc:
+            return "NEFT"
+        elif "RTGS" in desc:
+            return "RTGS"
+        elif "UPI" in desc:
+            return "UPI"
+        elif "DD" in desc or "DEMAND DRAFT" in desc:
+            return "Demand Draft"
+        elif "CHQ" in desc or "CHEQUE" in desc:
+            return "Cheque"
+        elif "IMPS" in desc:
+            return "IMPS"
+        elif "INF" in desc or "INTERNET BANKING" in desc:
+            return "Internet Banking"
+        elif "ACH" in desc:
+            return "ACH"
+        elif "CASH" in desc:
+            return "CASH"
+        else:
+            return "Other"
+
+    
+    transactions_df['Mode'] = transactions_df['Description'].apply(detect_mode)
+
+    cols = transactions_df.columns.tolist()
+    if 'Balance' in cols:
+        balance_idx = cols.index('Balance')
+        # Remove mode from current position
+        cols.remove('Mode')
+        # Insert mode right after balance
+        cols.insert(balance_idx + 1, 'Mode')
+
+    # Reorder the DataFrame
+    transactions_df = transactions_df[cols]
+    return transactions_df
+
+
 
 
 def generate_summary_sheet(normalized_file, output_file):
@@ -1559,6 +1664,13 @@ def generate_summary_sheet(normalized_file, output_file):
     print("[INFO] Generating Scoring Details...")
     scoring_df = generate_scoring_details(transactions_df.copy())
 
+    print("[INFO] Generating Return Transaction Details...")
+    return_txn_df = generate_return_txn(transactions_df.copy())
+
+    
+    print("[INFO] Generating Transaction Details...")
+    xns_txn_df = generate_xns_sheet(transactions_df.copy())
+
     print("[INFO] Generating Recurring Credit Details...")
     recurring_credit_df = generate_recurring_credit_debit(transactions_df.copy(), val='CREDIT')
 
@@ -1566,8 +1678,12 @@ def generate_summary_sheet(normalized_file, output_file):
     recurring_debit_df = generate_recurring_credit_debit(transactions_df.copy(), val='DEBIT')
     
     print("[INFO] Generating Fraud Sheet Details...")
+    # if not recurring_credit_df.empty or not recurring_debit_df.empty:
     duplicates_df = generate_duplicates(recurring_credit_df , recurring_debit_df)
     fraud_sheet_df,sus_txns_df = generate_fraud_sheet(transactions_df.copy(), duplicates_df)
+    # else: 
+    #     fraud_sheet_df,sus_txns_df = generate_fraud_sheet(transactions_df.copy())
+
     
     
     # Save to Excel
@@ -1582,14 +1698,17 @@ def generate_summary_sheet(normalized_file, output_file):
             recurring_credit_df.to_excel(writer, index=False, sheet_name='Recurring Credit')  
         if not recurring_debit_df.empty:
             recurring_debit_df.to_excel(writer, index=False, sheet_name='Recurring Debit')
-        # if not duplicates_df.empty:
-        #     duplicates_df.to_excel(writer ,index=False , sheet_name='Duplicates_Fraud_Sheet')      
+        if not return_txn_df.empty:
+            return_txn_df.to_excel(writer, index=False, sheet_name='Return Txn')
+        if not duplicates_df.empty:
+            duplicates_df.to_excel(writer ,index=False , sheet_name='Duplicates_Fraud_Sheet')      
         if not fraud_sheet_df.empty:
             fraud_sheet_df.to_excel(writer, index=False, sheet_name='Fraud Check Sheet', startrow=0)
             sus_txns_df.to_excel(writer , index=False ,sheet_name='Fraud Check Sheet',startrow=len(fraud_sheet_df)+3 )   
             if not duplicates_df.empty:
                duplicates_df.to_excel(writer ,index=False , sheet_name='Fraud Check Sheet', startrow=len(fraud_sheet_df+sus_txns_df))
-        transactions_df.to_excel(writer, index=False, sheet_name='Xns')
+        if not xns_txn_df.empty:
+            xns_txn_df.to_excel(writer, index=False, sheet_name='Xns')
 
     
     print(f"[SUCCESS] Saved summary sheet to {output_file}")
