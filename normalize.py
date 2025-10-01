@@ -133,6 +133,7 @@ def normalize_headers(df):
                         column_mapping[orig_col] = std_col
                         used_standard_cols.add(std_col)
                         mapped = True
+                        print(f"Mapped {orig_col} to {std_col}")
                         break
                 if mapped:
                     break
@@ -140,6 +141,7 @@ def normalize_headers(df):
             column_mapping[orig_col] = orig_col
 
     new_df = new_df.rename(columns=column_mapping)
+    # print(f"New dataframe: {new_df}")
     
     # Step 2b: Handle separate Debit/Credit columns ONLY if both exist
     debit_col_candidates = [c for c in new_df.columns if 'debit' in c.lower() and c != 'Credit/Debit']
@@ -148,19 +150,22 @@ def normalize_headers(df):
     if debit_col_candidates and credit_col_candidates:
         debit_col = debit_col_candidates[0]
         credit_col = credit_col_candidates[0]
+        # print(f"Debit column: {debit_col}, Credit column: {credit_col}")
 
         # Only apply if BOTH columns exist
         # Safely create Credit/Debit column
         def get_cd(row):
-            if pd.notna(row[credit_col]) and row[credit_col] != 0:
+            # print(f"Row: {row}\n")
+            if pd.notna(row[credit_col]) and row[credit_col] != 0 and row[credit_col] != '-':
+                # print(f"Credit column: {credit_col}")
                 return 'CREDIT'
-            elif pd.notna(row[debit_col]) and row[debit_col] != 0:
+            elif pd.notna(row[debit_col]) and row[debit_col] != 0 and row[debit_col] != '-':
                 return 'DEBIT'
             else:
                 return pd.NA
 
         new_df['Credit/Debit'] = new_df.apply(get_cd, axis=1)
-
+        # print(f"New dataframe: {new_df['Credit/Debit']}")
         # Fill Amount column safely
         new_df['Amount'] = new_df.apply(
             lambda row: row[credit_col] 
@@ -190,6 +195,8 @@ def normalize_headers(df):
     # ---- Step 4: Parse and standardize Date ----
     if 'Date' in new_df.columns:
         new_df['Date'] = parse_transaction_dates(new_df['Date']).dt.strftime('%d/%m/%Y')
+    
+    # print(f"New dataframe: {new_df}")
 
     # ---- Step 5: Normalize Credit/Debit values ----
     if 'Credit/Debit' in new_df.columns:
@@ -198,7 +205,9 @@ def normalize_headers(df):
             'DR': 'DEBIT',
             'CR': 'CREDIT',
             'D': 'DEBIT',
-            'C': 'CREDIT'
+            'C': 'CREDIT',
+            'Transfer Credit': 'CREDIT',
+            'Transfer Debit': 'DEBIT',
         })
 
     for col in ['Credit', 'Debit', 'Amount', 'Balance']:
