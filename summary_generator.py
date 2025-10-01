@@ -61,6 +61,10 @@ def generate_scoring_details(transactions_df):
     # Derive signed amounts
     df['Credit_Amount'] = df.loc[df['Credit/Debit'] == 'CREDIT', 'Amount_Clean']
     df['Debit_Amount'] = df.loc[df['Credit/Debit'] == 'DEBIT', 'Amount_Clean']
+    total_credit_amount = df.loc[df['Credit/Debit'] == 'CREDIT', 'Amount_Clean'].sum()
+    total_debit_amount = df.loc[df['Credit/Debit'] == 'DEBIT', 'Amount_Clean'].sum()
+    total_credit_count = df.loc[df['Credit/Debit'] == 'CREDIT', 'Amount_Clean'].count()
+    total_debit_count = df.loc[df['Credit/Debit'] == 'DEBIT', 'Amount_Clean'].count()
 
     # Month key
     df['Month'] = df['Date'].dt.to_period('M')
@@ -75,12 +79,12 @@ def generate_scoring_details(transactions_df):
     ).fillna(0)
 
     # Monthly Average Inflow/Outflow (mean of monthly sums)
-    monthly_avg_inflow = round(monthly['credit_sum'].mean(), 2) if not monthly.empty else 0
-    monthly_avg_outflow = round(monthly['debit_sum'].mean(), 2) if not monthly.empty else 0
+    monthly_avg_inflow = round(monthly.loc[monthly['credit_sum'] > 0, 'credit_sum'].mean(), 2) if not monthly.empty else 0
+    monthly_avg_outflow = round(monthly.loc[monthly['debit_sum'] > 0, 'debit_sum'].mean(), 2) if not monthly.empty else 0
 
     # Average Credit/Debit Transactions (mean of monthly amounts)
-    avg_credit_txn = round(monthly['credit_sum'].mean(), 2) if not monthly.empty else 0
-    avg_debit_txn = round(monthly['debit_sum'].mean(), 2) if not monthly.empty else 0
+    avg_credit_txn = round(total_credit_amount / total_credit_count, 2) if not monthly.empty else 0
+    avg_debit_txn = round(total_debit_amount / total_debit_count, 2) if not monthly.empty else 0
 
     # Totals
     total_credit_amount = round(df['Credit_Amount'].sum(skipna=True), 2)
@@ -328,7 +332,7 @@ def generate_monthwise_analysis(transactions_df):
         return pd.DataFrame()
     
     # Convert Date column to datetime
-    transactions_df['Date'] = pd.to_datetime(transactions_df['Date'], format='%d/%m/%Y', errors='coerce')
+    transactions_df['Date'] = pd.to_datetime(transactions_df['Date'], format='%d/%m/%Y', errors='coerce').dt.normalize()
     
     # Extract month-year for grouping
     transactions_df['Month_Year'] = transactions_df['Date'].dt.to_period('M')
@@ -344,12 +348,38 @@ def generate_monthwise_analysis(transactions_df):
     
     monthly_data = []
     
+    # Get last balance of the day (unique per date)
+    # Get last balance per day (unique index)
+    daily_balance = transactions_df.groupby('Date')['Balance_Clean'].last()
+
+    # Full calendar range
+    all_days = pd.date_range(transactions_df['Date'].min(), transactions_df['Date'].max(), freq='D')
+
+    # Reindex to all days and forward-fill missing balances
+    daily_balance = daily_balance.reindex(all_days).ffill().fillna(0)
+
+
+
     # Group by month
     for month_year, group in transactions_df.groupby('Month_Year'):
         month_name = f"{calendar.month_abbr[month_year.month]}-{str(month_year.year)[-2:]}"
+
+        
+        # Get the first and last day of the month
+        month_start = month_year.to_timestamp()
+        month_end = (month_year + 1).to_timestamp() - pd.Timedelta(days=1)
+        # Create the date range for this month
+        month_range = pd.date_range(month_start, month_end).normalize()
+
+        # Slice daily_balance for this month
+        month_daily_balances = daily_balance.reindex(month_range).ffill().fillna(0)
+
+        # Compute average bank balance
+        avg_balance = month_daily_balances.mean()
+
         
         # Calculate metrics
-        avg_balance = group['Balance_Clean'].mean() if not group['Balance_Clean'].empty else 0
+        # avg_balance = group['Balance_Clean'].mean() if not group['Balance_Clean'].empty else 0
         max_balance = group['Balance_Clean'].max() if not group['Balance_Clean'].empty else 0
         min_balance = group['Balance_Clean'].min() if not group['Balance_Clean'].empty else 0
         
