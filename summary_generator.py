@@ -113,7 +113,9 @@ def generate_scoring_details(transactions_df):
         df.sort_values('Date').groupby('Month')['Balance_Clean'].last()
     )
     last_90d_cut = df['Date'].max() - pd.Timedelta(days=90)
+    print("last_90d_cut",last_90d_cut)
     last_180d_cut = df['Date'].max() - pd.Timedelta(days=180)
+    print("last_180d_cut",last_180d_cut)
     meb_90 = round(month_end_balance[month_end_balance.index.to_timestamp() >= last_90d_cut].mean(), 2) if not month_end_balance.empty else 0
     meb_180 = round(month_end_balance[month_end_balance.index.to_timestamp() >= last_180d_cut].mean(), 2) if not month_end_balance.empty else 0
 
@@ -720,7 +722,7 @@ def generate_duplicates(recurring_credit_df , recurring_debit_df):
         except:
             return np.nan
 
-    def compare_rows(row1, row2, columns_to_compare):
+    def compare_rows(row1, row2, columns_to_compare, max_differences=1):
         """
         Compare two rows with specific logic:
         - Amount MUST match exactly
@@ -773,8 +775,8 @@ def generate_duplicates(recurring_credit_df , recurring_debit_df):
                 other_diff_count += 1
                 differences.append(f"{col}: {val1} vs {val2}")
         
-        # Allow only 1 difference in other fields (excluding Balance)
-        if other_diff_count > 1:
+        # Allow only max_differences difference in other fields (excluding Balance)
+        if other_diff_count > max_differences:
             return False, differences, f"Too many differences in other fields: {other_diff_count}"
         
         # If we reach here, it's a duplicate
@@ -785,58 +787,72 @@ def generate_duplicates(recurring_credit_df , recurring_debit_df):
 
     def find_duplicates(df, max_differences=2):
         """
-        Find duplicate rows based on refined comparison logic:
-        - Amount MUST match exactly
+        Optimized duplicate detection:
+        - Amount MUST match exactly (bucketing step)
         - Description should be mostly similar (80%+)
         - Other fields can have max 1 difference
-        - Balance is excluded from comparison
+        - Balance excluded
         """
+
         print(f"Analyzing {len(df)} rows for duplicates...")
-        
-        # Get columns to compare (exclude index, ID columns, canonical description, and balance)
-        columns_to_compare = [col for col in df.columns if col not in ['index', 'id', 'Index', 'ID', 'Canonical_Description', 'Balance']]
-        
+
+        # Exclude columns not used in comparison
+        columns_to_compare = [
+            col for col in df.columns 
+            if col not in ['index', 'id', 'Index', 'ID', 'Canonical_Description', 'Balance']
+        ]
+
         print(f"Comparing columns: {columns_to_compare}")
         print("Criteria: Amount must match exactly, Description 80%+ similar, Other fields max 1 difference")
-        
+
         duplicate_groups = []
         processed_indices = set()
         group_id = 1
-        
-        for i in range(len(df)):
-            if i in processed_indices:
-                continue
-                
-            current_group = [i]
-            processed_indices.add(i)
-            
-            # Compare with all subsequent rows
-            for j in range(i + 1, len(df)):
-                if j in processed_indices:
+
+        # Step 1: group by Amount (since it's a hard requirement)
+        grouped = df.groupby("Amount")
+
+        for amount, group in grouped:
+            if len(group) < 2:
+                continue  # no possible duplicates here
+
+            indices = group.index.tolist()
+
+            for i_idx in range(len(indices)):
+                i = indices[i_idx]
+                if i in processed_indices:
                     continue
-                    
-                is_duplicate, differences, reason = compare_rows(df.iloc[i], df.iloc[j], columns_to_compare)
-                
-                # If it's a duplicate according to our refined logic
-                if is_duplicate:
-                    current_group.append(j)
-                    processed_indices.add(j)
-            
-            # Only keep groups with 2 or more rows
-            if len(current_group) >= 2:
-                duplicate_groups.append({
-                    'group_id': group_id,
-                    'indices': current_group,
-                    'size': len(current_group)
-                })
-                group_id += 1
-        
+
+                current_group = [i]
+                processed_indices.add(i)
+
+                for j_idx in range(i_idx + 1, len(indices)):
+                    j = indices[j_idx]
+                    if j in processed_indices:
+                        continue
+
+                    is_duplicate, differences, reason = compare_rows(
+                        df.loc[i], df.loc[j], columns_to_compare, max_differences=max_differences
+                    )
+
+                    if is_duplicate:
+                        current_group.append(j)
+                        processed_indices.add(j)
+
+                if len(current_group) >= 2:
+                    duplicate_groups.append({
+                        'group_id': group_id,
+                        'indices': current_group,
+                        'size': len(current_group)
+                    })
+                    group_id += 1
+
         return duplicate_groups
 
-# Load data
+    # Load data
     print("Loading grouped credit and debit files...")
-    df_credits = credit_file
-    df_debits = debit_file
+    df_credits = credit_file.reset_index(drop=True)
+    df_debits = debit_file.reset_index(drop=True)
 
     print(f"Credits: {len(df_credits)} rows")
     print(f"Debits: {len(df_debits)} rows")
