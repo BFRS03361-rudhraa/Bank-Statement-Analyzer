@@ -1619,6 +1619,8 @@ def generate_summary_sheet(normalized_file, output_file):
     
     # Create summary data
     summary_data = []
+    summary_data.append(['Summary – Scorecard'])
+    summary_data.append(['Item', 'Details', 'Verification'])
     
     # Customer Name
     customer_name = metadata_dict.get('account_name', 'NA')
@@ -1694,9 +1696,107 @@ def generate_summary_sheet(normalized_file, output_file):
     # MICR Code
     micr_code = metadata_dict.get('micr_code', 'NA')
     summary_data.append(['MICR Code', micr_code, ''])
+
+    summary_data.append([])
     
     # Create DataFrame
-    summary_df = pd.DataFrame(summary_data, columns=['Item', 'Details', 'Verification'])
+    # summary_df = pd.DataFrame(summary_data, columns=['Item', 'Details', 'Verification'])
+
+    # 2. Fixed Income / Obligation
+    summary_data.append(['Fixed Income / Obligation'])
+    summary_data.append(['Type', 'Type Identified', 'Amount'])
+    
+    # Look for EMI-related keywords in descriptions
+    emi_keywords = ['emi', 'loan', 'installment', 'repayment', 'monthly payment']
+    descriptions = transactions_df['Description'].astype(str).str.lower()
+    
+    # Determine probable EMI amount (sum of debit transactions matching EMI keywords)
+    emi_mask = descriptions.str.contains('|'.join(emi_keywords), na=False)
+    debit_mask = transactions_df['Credit/Debit'].astype(str).str.upper() == 'DEBIT'
+    emi_amt = pd.to_numeric(transactions_df.loc[emi_mask & debit_mask, 'Amount'].astype(str).str.replace(',', ''), errors='coerce').sum()
+           
+    def detect_salary_transactions(transactions_df):
+        salary_keywords = ['SALARY', 'SAL', 'PAYROLL', 'WAGES']
+        df_credits = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'CREDIT'].copy()
+        mask = df_credits['Description'].astype(str).str.contains('|'.join(salary_keywords), case=False, na=False)
+        salary_txns = df_credits.loc[mask]
+        salary_amt = pd.to_numeric(salary_txns['Amount'].astype(str).str.replace(',', ''), errors='coerce').sum()
+        return salary_amt, len(salary_txns)
+
+    fixed_income_data =[]
+    salary_transactions,count = detect_salary_transactions(transactions_df)
+    probable_salary_amount = salary_transactions if salary_transactions else 'Not Identified'
+    emi_amount = emi_amt
+    fixed_income_data.append(['Salary', 'NO', 'Not Identified'])
+    fixed_income_data.append(['Probable Salary', 'YES' if salary_transactions else 'NO', probable_salary_amount])
+    fixed_income_data.append(['EMI', 'YES' if emi_amount > 0 else 'NO', emi_amount])
+    summary_data.extend(fixed_income_data)
+    summary_data.append([])
+
+    # fixed_income_df = pd.DataFrame(fixed_income_data, columns=['Item', 'Type Identified', 'Amount'])
+    def generate_fingerprint_remarks(normalized_file):
+
+     return 
+    # 3. Document Authencitity Check
+    summary_data.append(['Document Authenticity Check'])
+    summary_data
+    doc_auth_data =[]
+    doc_auth_data.append(['Fingerprint Check', 'NA', 'na'])
+    doc_auth_data.append(['Balance Recon', 'YES', ''])
+    summary_data.extend(doc_auth_data)
+    summary_data.append([])
+
+    # 4. Bounce/Return Identification
+
+    bounce_data = []
+    bounce_data.append(['Particulars', 'Details'])
+    # Fix keyword list and counting
+    bounce_keywords = ['bounce', 'returned', 'return', 'dishonour', 'insufficient funds', 'cheque return']
+    descriptions = transactions_df['Description'].astype(str).str.lower()
+    bounce_mask = descriptions.str.contains('|'.join(bounce_keywords), na=False)
+    bounce_count = int(bounce_mask.sum())
+    bounce_amount = pd.to_numeric(transactions_df.loc[bounce_mask, 'Amount'].astype(str).str.replace(',', ''), errors='coerce').sum()
+    
+    bounce_data.append(['Amount of Cheque Bounce', round(bounce_amount, 2)])
+    bounce_data.append(['Count of Cheque Bounce', bounce_count])
+    bounce_data.append(['Return EMI Fund Insufficient', 0])
+    summary_data.extend(bounce_data)
+    summary_data.append([])
+
+    #Part 5: Bureau Rating
+
+    bureau_data = []
+    bureau_data.append(['Bereau Rating'])
+    bureau_data.append(['Item', 'Bureau Ratings', 'Bank Statement', 'Reconciled'])
+    total_emis = len(transactions_df[transactions_df['Description'].str.contains('EMI|LOAN', case=False, na=False)]) if 'Description' in transactions_df.columns else 'NA'
+    emi_value = sum(transactions_df[transactions_df['Description'].str.contains('EMI|LOAN', case=False, na=False)]['Amount']) if 'Amount' in transactions_df.columns else 'NA'
+    bureau_data.append(['Total EMIs', 'NA', total_emis, 'NA'])
+    bureau_data.append(['EMI Value', 'NA', emi_value, 'NA'])
+    summary_data.extend(bureau_data)
+    summary_data.append([])
+
+    # Part 6: Credit Card
+    summary_data.append(['Credit Card','Details Verification'])
+    summary_data.append(['Item', 'Credit Card', 'Bank Statement', 'Reconciled'])
+    cc_data = []
+    cc_data.append(['Payment Made', 'NA', 0, 'NA'])
+    cc_data.append(['Payment Amount', 'NA', 0, 'NA'])
+    cc_data.append(['Payment Due', 'NA', 'NA', 'NA'])
+    summary_data.extend(cc_data)
+    summary_data.append([])
+
+    # Part 7: Salary Details
+    summary_data.append(['Salary Details'])
+    summary_data.append(['Item', 'Salary Slip', 'Bank Statement', 'Reconciled'])
+    salary_data = []
+    salary_transactions, count= detect_salary_transactions(transactions_df)
+    salary_data.append(['Total Salary Transaction', 'NA', count if salary_transactions else 0, 'NA'])
+    summary_data.extend(salary_data)
+    summary_df = pd.DataFrame(summary_data)
+    summary_df.to_excel(output_file, sheet_name='Summary', index=False, header=False)
+    print(f"[INFO] Summary sheet generated at {output_file}")        
+    
+
     
     # Generate month-wise analysis
     print("[INFO] Generating month-wise analysis...")
@@ -1746,8 +1846,8 @@ def generate_summary_sheet(normalized_file, output_file):
             recurring_debit_df.to_excel(writer, index=False, sheet_name='Recurring Debit')
         if not return_txn_df.empty:
             return_txn_df.to_excel(writer, index=False, sheet_name='Return Txn')
-        if not duplicates_df.empty:
-            duplicates_df.to_excel(writer ,index=False , sheet_name='Duplicates_Fraud_Sheet')      
+        # if not duplicates_df.empty:
+        #     duplicates_df.to_excel(writer ,index=False , sheet_name='Duplicates_Fraud_Sheet')      
         if not fraud_sheet_df.empty:
             fraud_sheet_df.to_excel(writer, index=False, sheet_name='Fraud Check Sheet', startrow=0)
             sus_txns_df.to_excel(writer , index=False ,sheet_name='Fraud Check Sheet',startrow=len(fraud_sheet_df)+3 )   
