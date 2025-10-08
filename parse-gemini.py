@@ -2,11 +2,12 @@ import array
 import os
 import json
 import re
+import string
 import time
 import google.generativeai as genai
 from dotenv import load_dotenv
 from pdf2image import convert_from_path
-from PIL import Image
+from PIL import Image,ImageEnhance, ImageFilter, ImageOps
 import pandas as pd
 
 # Load API key and configure model
@@ -30,6 +31,15 @@ def convert_pdf_to_images(pdf_path, output_folder, dpi=300):
     print(f"[convert] Saved {len(image_paths)} image(s) to {output_folder}")
     return image_paths
 
+def preprocess_image_for_ocr(image_path):
+    """Enhance contrast and clarity before passing to Gemini."""
+    img = Image.open(image_path).convert("L")  # grayscale
+    img = ImageOps.autocontrast(img)
+    enhancer = ImageEnhance.Contrast(img)
+    img = enhancer.enhance(1.8)
+    img = img.filter(ImageFilter.SHARPEN)
+    return img
+
 
 def split_image(image_path):
     image = Image.open(image_path)
@@ -46,13 +56,18 @@ def split_image(image_path):
     return top_path, bottom_path
 
 
-def ocr_with_gemini(image_path,canonical_header=None):
+def ocr_with_gemini(image_path,canonical_header=None, hsbc_case=None):
     header_instruction = ""
     if canonical_header:
         header_instruction = f"""
         Use the following column headers as the canonical header for the transaction table:
         {json.dumps(canonical_header, ensure_ascii=False)}
         Ensure that every transaction entry uses these exact column names as keys.Output no other keys besides the canonical header, and do not invent any new fields."""
+    
+    hsbc_narrative_instruction=""
+    if hsbc_case:
+        hsbc_narrative_instruction = f""" 
+            Every transaction has a row below it with two columns , called Narrative and the description of transaction above . Parse and append that narrative row as a column with it's transaction json."""
     
     prompt = f"""
     You are an expert bank statement extractor.
@@ -61,6 +76,7 @@ def ocr_with_gemini(image_path,canonical_header=None):
     - "metadata": should ONLY contain account/customer information like account number, name, address, statement period, etc., present before the transaction table. Metadata should NEVER contain transaction rows, table headers, or any financial data. If no key-value metadata is found, extract the entire metadata block as a single string field under "raw_metadata".
     - "transactions": a list of objects, each representing a transaction with exact column names and values as present in the document.
 
+    {hsbc_narrative_instruction}
     Do NOT normalize, modify, or clean the data. Preserve every detail exactly as it appears with 100 percent accuracy. The values should be present in their exact columns with 100% accuracy , no values should be misplaced into other columns or adjacent empty columns so recheck every line properly .
     Do NOT invent any new keys or columns. If a column is missing a value, leave it as an empty string. Never shift values between columns.
     Only extract data that is directly visible. DO NOT MAKE UP ANY TRANSACTION THAT IS NOT VISIBLE.
@@ -80,9 +96,8 @@ def ocr_with_gemini(image_path,canonical_header=None):
       ]
     }}
     """
-
-    print(f"[ocr] Opening image: {image_path}")
-    image = Image.open(image_path)
+    print(f"[ocr] Preprocessing image for OCR: {image_path}")
+    image = preprocess_image_for_ocr(image_path)
     print("[ocr] Calling Gemini model…")
     t0 = time.time()
     response = model.generate_content([prompt, image])
@@ -92,8 +107,8 @@ def ocr_with_gemini(image_path,canonical_header=None):
     return text
 
 
-def ocr_with_gemini_with_fallback(image_path, canonical_header=None):
-    text = ocr_with_gemini(image_path, canonical_header=canonical_header)
+def ocr_with_gemini_with_fallback(image_path, canonical_header=None, hsbc=None):
+    text = ocr_with_gemini(image_path, canonical_header=canonical_header,hsbc_case=hsbc)
     parsed = parse_json_from_llm(text)
 
     print("parsed", parsed)
@@ -103,8 +118,8 @@ def ocr_with_gemini_with_fallback(image_path, canonical_header=None):
         print("[ocr fallback] Initial OCR failed, splitting image and retrying…")
         top_img, bottom_img = split_image(image_path)
 
-        top_text = ocr_with_gemini(top_img, canonical_header=canonical_header)
-        bottom_text = ocr_with_gemini(bottom_img, canonical_header=canonical_header)
+        top_text = ocr_with_gemini(top_img, canonical_header=canonical_header, hsbc_case=hsbc)
+        bottom_text = ocr_with_gemini(bottom_img, canonical_header=canonical_header, hsbc_case=hsbc)
         print("top", top_text)
         print("bottom", bottom_text)
 
@@ -181,8 +196,8 @@ def _extract_largest_json_object(text: str):
 
     if largest_obj:
         return {
-            "metadata": obj.get("metadata", {}),
-            "transactions": obj.get("transactions", [])
+            "metadata": largest_obj.get("metadata", {}),
+            "transactions": largest_obj.get("transactions", [])
         }
     return {"metadata": {}, "transactions": []}
 
@@ -302,7 +317,7 @@ def apply_canonical_header(transactions, canonical_header):
     return normalized
 
 
-def process_pdf(pdf_path, output_dir, pages=0):
+def process_pdf(pdf_path, output_dir,hsbc=None, pages=0):
     base_name = os.path.splitext(os.path.basename(pdf_path))[0]
     image_dir = os.path.join(output_dir, f"{base_name}_images")
     print(f"[start] Processing file: {pdf_path}")
@@ -320,9 +335,9 @@ def process_pdf(pdf_path, output_dir, pages=0):
     for i, image_path in enumerate(image_paths):
         print(f"Processing page {i+1}/{len(image_paths)}...")
         if i == 0:
-            page_obj = ocr_with_gemini_with_fallback(image_path)
+            page_obj = ocr_with_gemini_with_fallback(image_path, hsbc=hsbc)
         else:
-            page_obj = ocr_with_gemini_with_fallback(image_path, canonical_header=canonical_header)
+            page_obj = ocr_with_gemini_with_fallback(image_path, canonical_header=canonical_header, hsbc=hsbc)
 
         raw_json_path = os.path.join(output_dir, f"{base_name}_page_{i+1}.json")
         # with open(raw_json_path, 'w', encoding='utf-8') as f:
@@ -392,7 +407,9 @@ def main():
     parser = argparse.ArgumentParser(description='OCR Financial Document Page-by-Page into JSON and Excel')
     parser.add_argument('input', help='Path to PDF file or folder')
     parser.add_argument('--out', default='./output', help='Output directory')
+    parser.add_argument('--hsbc' ,default=None, help='Processing for hsbc statement' )
     parser.add_argument('--pages', type=int, default=0, help='Max pages to process (0 = all)')
+    
     args = parser.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -401,9 +418,9 @@ def main():
         for file in os.listdir(args.input):
             if file.lower().endswith('.pdf'):
                 pdf_path = os.path.join(args.input, file)
-                process_pdf(pdf_path, args.out, args.pages)
+                process_pdf(pdf_path, args.out,args.hsbc, args.pages)
     else:
-        process_pdf(args.input, args.out, args.pages)
+        process_pdf(args.input, args.out, args.hsbc ,args.pages)
 
 if __name__ == '__main__':
     main()
