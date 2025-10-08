@@ -101,7 +101,7 @@ def normalize_headers(df):
     # Standard column mappings
     standard_columns = {
         'Credit/Debit': ['cr/dr','dr/cr', 'cr dr', 'credit debit', 'type', 'transaction type', 'debit credit'],
-        'Description': ['description', 'narration', 'particulars', 'details', 'transaction details'],
+        'Description': ['description', 'narration','narrative', 'particulars', 'details', 'transaction details'],
         'Credit':['credit', 'credit amount', 'desposit', 'cr'],
         'Debit':['debit', 'debit amount','withdrawal', 'dr'],
         'Amount': ['amount', 'transaction amount', 'transaction value', 'amount(inr)', 'transaction amount(inr)'],
