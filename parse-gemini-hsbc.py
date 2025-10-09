@@ -62,7 +62,7 @@ def prompt_hsbc(header_instruction,hsbc_narrative_instruction) :
 
         Extract the data from this financial document image as a structured JSON object with two keys:
         - "metadata": should ONLY contain account/customer information like account number, name, address, statement period, etc., present before the transaction table. Metadata should NEVER contain transaction rows, table headers, or any financial data. If no key-value metadata is found, extract the entire metadata block as a single string field under "raw_metadata".
-        - "transactions": a list of objects, each representing a transaction with exact column names and values as present in the document.
+        - "transactions": a list of objects, each representing a transaction with exact column names and values as present in the document.DON'T Parse the narrative row into transaction rows.
         - "Narrative" : a list of object , each having a column named Narrative and it's value as present in the document.
 
         Do NOT normalize, modify, or clean the data. Preserve every detail exactly as it appears with 100 percent accuracy. The values should be present in their exact columns with 100% accuracy , no values should be misplaced into other columns or adjacent empty columns so recheck every line properly .
