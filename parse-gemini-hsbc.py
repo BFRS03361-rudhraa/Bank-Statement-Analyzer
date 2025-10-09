@@ -460,8 +460,16 @@ def process_pdf(pdf_path, output_dir,hsbc=None, pages=0):
                 narrative_values.append(' '.join(val.split()) if isinstance(val, str) else val)
             else:
                 narrative_values.append(str(item) if item is not None else "")
-        for idx, txn in enumerate(aggregated_transactions):
-            txn["Narrative"] = narrative_values[idx] if idx < len(narrative_values) else ""
+        
+        narrative_idx = 0
+        for txn in aggregated_transactions:
+            # Check if transaction row has any meaningful values
+            has_values = any(value and str(value).strip() for value in txn.values())
+            if has_values and narrative_idx < len(narrative_values):
+                txn["Narrative"] = narrative_values[narrative_idx]
+                narrative_idx += 1
+            else:
+                txn["Narrative"] = ""
     # Save to Excel
     metadata_df = pd.DataFrame(list(structured_metadata.items()), columns=['Key', 'Value'])
     transactions_df = pd.DataFrame(aggregated_transactions)

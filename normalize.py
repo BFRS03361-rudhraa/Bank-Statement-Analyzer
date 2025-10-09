@@ -19,11 +19,14 @@ def clean_amount(value):
 
     # Handle explicit CR/DR suffix
     sign = 1
-    if val.endswith("CR"):
+    if val.endswith("CR" or "CR"):
         sign = 1
         val = val[:-2]
     elif val.endswith("DR"):
-        sign = -1
+        sign = 1
+        val = val[:-2]
+    elif val.endswith("DR."):
+        sign = 1
         val = val[:-2]
 
     # Remove currency words/symbols
@@ -101,11 +104,11 @@ def normalize_headers(df):
     # Standard column mappings
     standard_columns = {
         'Credit/Debit': ['cr/dr','dr/cr', 'cr dr', 'credit debit', 'type', 'transaction type', 'debit credit'],
-        'Description': ['description', 'narration','narrative', 'particulars', 'details', 'transaction details'],
-        'Credit':['credit', 'credit amount', 'desposit', 'cr'],
+        'Description': ['description', 'narration','narrative', 'particulars', 'details', 'transaction details','remarks','naration'],
+        'Credit':['credit', 'credit amount', 'deposit', 'cr'],
         'Debit':['debit', 'debit amount','withdrawal', 'dr'],
+        'Balance': ['balance', 'available balance', 'running balance', 'closing balance', 'available balance(inr)','total'],
         'Amount': ['amount', 'transaction amount', 'transaction value', 'amount(inr)', 'transaction amount(inr)'],
-        'Balance': ['balance', 'available balance', 'running balance', 'closing balance', 'available balance(inr)'],
         
     }
 
@@ -133,7 +136,7 @@ def normalize_headers(df):
                         column_mapping[orig_col] = std_col
                         used_standard_cols.add(std_col)
                         mapped = True
-                        print(f"Mapped {orig_col} to {std_col}")
+                        # print(f"Mapped {orig_col} to {std_col}")
                         break
                 if mapped:
                     break
@@ -154,6 +157,10 @@ def normalize_headers(df):
 
         # Only apply if BOTH columns exist
         # Safely create Credit/Debit column
+        for col in ['Credit', 'Debit']:
+            if col in new_df.columns:
+                new_df[col] = new_df[col].apply(clean_amount)
+
         def get_cd(row):
             # print(f"Row: {row}\n")
             if pd.notna(row[credit_col]) and row[credit_col] != 0 and row[credit_col] != '-':
@@ -167,6 +174,7 @@ def normalize_headers(df):
         new_df['Credit/Debit'] = new_df.apply(get_cd, axis=1)
         # print(f"New dataframe: {new_df['Credit/Debit']}")
         # Fill Amount column safely
+        
         new_df['Amount'] = new_df.apply(
             lambda row: row[credit_col] 
                         if pd.notna(row['Credit/Debit']) and row['Credit/Debit'] == 'CREDIT'
@@ -179,7 +187,7 @@ def normalize_headers(df):
         # Otherwise, keep the original Amount and Credit/Debit columns as they are
         if 'Amount' not in new_df.columns:
             # if missing, try to infer from existing columns (optional)
-            pass
+            pass  
 
 
     # ---- Step 3: Reorder columns ----
@@ -187,7 +195,7 @@ def normalize_headers(df):
     for std_col in ['Date', 'Credit/Debit', 'Description', 'Amount', 'Balance']:
         if std_col in new_df.columns:
             final_columns.append(std_col)
-    for col in new_df.columns:
+    for col in new_df.columns:   
         if col not in final_columns:
             final_columns.append(col)
     new_df = new_df[final_columns]
@@ -204,6 +212,8 @@ def normalize_headers(df):
         new_df['Credit/Debit'] = new_df['Credit/Debit'].replace({
             'DR': 'DEBIT',
             'CR': 'CREDIT',
+            'DR.': 'DEBIT',
+            'CR.': 'CREDIT',
             'D': 'DEBIT',
             'C': 'CREDIT',
             'Transfer Credit': 'CREDIT',
