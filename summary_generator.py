@@ -314,14 +314,16 @@ def detect_cheque_bounce(transactions_df):
 
 def get_account_type(metadata_dict):
     """Determine account type from metadata."""
-    # This would need more sophisticated logic based on your data
-    # For now, return UNK as shown in the template
-    return "UNK"
+    account_fields = ['account type','account','type','account_type']
+    for field in account_fields:
+        if field in metadata_dict and metadata_dict[field]:
+            return metadata_dict[field]
+    return "NA"
 
 def get_bank_name(metadata_dict):
     """Extract bank name from metadata."""
     # Look for bank-related fields in metadata
-    bank_fields = ['bank', 'bank_name', 'institution']
+    bank_fields = ['Bank','bank name', 'bank_name', 'institution']
     for field in bank_fields:
         if field in metadata_dict and metadata_dict[field]:
             return metadata_dict[field]
@@ -636,6 +638,22 @@ def generate_return_txn(transactions_df):
             return "NEFT"
         elif "RTGS" in desc:
             return "RTGS"
+        elif "UPI" in desc:
+            return "UPI"
+        elif "DD" in desc or "DEMAND DRAFT" in desc:
+            return "Demand Draft"
+        elif "CHQ" in desc or "CHEQUE" in desc:
+            return "Cheque"
+        elif "IMPS" in desc:
+            return "IMPS"
+        elif "INF" in desc or "INTERNET BANKING" in desc:
+            return "Internet Banking"
+        elif "ACH" in desc:
+            return "ACH"
+        elif "CASH" in desc:
+            return "CASH"
+        elif "SALARY" in desc or "SAL" in desc:
+            return "Salary"
         else:
             return "Other"
     # Read transactions
