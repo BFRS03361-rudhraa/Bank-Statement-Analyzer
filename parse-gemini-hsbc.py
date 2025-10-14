@@ -140,12 +140,19 @@ def ocr_with_gemini(image_path,canonical_header=None, hsbc_case=None):
     response = model.generate_content([prompt, image])
     dt = time.time() - t0
     text = response.text or ""
-    print(f"[ocr] Response received in {dt:.2f}s, length={len(text)}")
-    return text
+    usage = getattr(response, 'usage_metadata', None)
+    # Normalize usage fields to a dict of ints
+    usage_info = {
+        "input_tokens": int(getattr(usage, 'prompt_token_count', 0)) if usage else 0,
+        "output_tokens": int(getattr(usage, 'candidates_token_count', 0)) if usage else 0,
+        "total_tokens": int(getattr(usage, 'total_token_count', 0)) if usage else 0,
+    }
+    print(f"[ocr] Response received in {dt:.2f}s, length={len(text)} tokens(in/out/total)={usage_info['input_tokens']}/{usage_info['output_tokens']}/{usage_info['total_tokens']}")
+    return text, usage_info, dt
 
 
 def ocr_with_gemini_with_fallback(image_path, canonical_header=None, hsbc=None):
-    text = ocr_with_gemini(image_path, canonical_header=canonical_header,hsbc_case=hsbc)
+    text, usage_info, dt = ocr_with_gemini(image_path, canonical_header=canonical_header,hsbc_case=hsbc)
     parsed = parse_json_from_llm(text,hsbc=hsbc)
 
     print("parsed", parsed)
@@ -155,8 +162,8 @@ def ocr_with_gemini_with_fallback(image_path, canonical_header=None, hsbc=None):
         print("[ocr fallback] Initial OCR failed, splitting image and retrying…")
         top_img, bottom_img = split_image(image_path)
 
-        top_text = ocr_with_gemini(top_img, canonical_header=canonical_header, hsbc_case=hsbc)
-        bottom_text = ocr_with_gemini(bottom_img, canonical_header=canonical_header, hsbc_case=hsbc)
+        top_text, top_usage, top_dt = ocr_with_gemini(top_img, canonical_header=canonical_header, hsbc_case=hsbc)
+        bottom_text, bottom_usage, bottom_dt = ocr_with_gemini(bottom_img, canonical_header=canonical_header, hsbc_case=hsbc)
         print("top", top_text)
         print("bottom", bottom_text)
 
@@ -179,8 +186,17 @@ def ocr_with_gemini_with_fallback(image_path, canonical_header=None, hsbc=None):
         os.remove(top_img)
         os.remove(bottom_img)
 
-        return {"metadata": combined_metadata, "transactions": combined_transactions,"Narrative":combined_narrative}
+        combined_usage = {
+            "input_tokens": (top_usage.get("input_tokens",0) + bottom_usage.get("input_tokens",0)),
+            "output_tokens": (top_usage.get("output_tokens",0) + bottom_usage.get("output_tokens",0)),
+            "total_tokens": (top_usage.get("total_tokens",0) + bottom_usage.get("total_tokens",0)),
+        }
+        combined_dt = top_dt + bottom_dt
 
+        return {"metadata": combined_metadata, "transactions": combined_transactions,"Narrative":combined_narrative, "_metrics": {"input_tokens": combined_usage["input_tokens"], "output_tokens": combined_usage["output_tokens"], "total_tokens": combined_usage["total_tokens"], "latency_s": combined_dt, "fallback_used": True}}
+
+    # No fallback needed; attach metrics from the single call
+    parsed["_metrics"] = {"input_tokens": usage_info["input_tokens"], "output_tokens": usage_info["output_tokens"], "total_tokens": usage_info["total_tokens"], "latency_s": dt, "fallback_used": False}
     return parsed
 
 
@@ -392,6 +408,8 @@ def process_pdf(pdf_path, output_dir,hsbc=None, pages=0):
     raw_metadata_blocks = []
     canonical_header = None  #
 
+    per_page_metrics = []
+    t_all_start = time.time()
     for i, image_path in enumerate(image_paths):
         print(f"Processing page {i+1}/{len(image_paths)}...")
         if i == 0:
@@ -408,6 +426,12 @@ def process_pdf(pdf_path, output_dir,hsbc=None, pages=0):
         if page_obj is None:
             print(f"Warning: Failed to parse JSON on page {i+1}. Skipping.")
             continue
+
+        # capture per-page metrics if available
+        if isinstance(page_obj, dict) and page_obj.get("_metrics"):
+            m = page_obj["_metrics"].copy()
+            m["page_index"] = i
+            per_page_metrics.append(m)
 
         if i == 0:
             # Extract canonical header from first page
@@ -480,6 +504,44 @@ def process_pdf(pdf_path, output_dir,hsbc=None, pages=0):
         transactions_df.to_excel(writer, sheet_name='Transactions', index=False)
 
     print(f"[save] Excel file: {excel_path}")
+
+    # ---------------- Stats Aggregation & Save ----------------
+    t_all_end = time.time()
+    total_time_s = t_all_end - t_all_start
+    pages_count = len(per_page_metrics)
+    total_input_tokens = sum(m.get("input_tokens", 0) for m in per_page_metrics)
+    total_output_tokens = sum(m.get("output_tokens", 0) for m in per_page_metrics)
+    total_tokens = sum(m.get("total_tokens", 0) for m in per_page_metrics)
+    total_latency_s = sum(m.get("latency_s", 0.0) for m in per_page_metrics)
+
+    avg_input_tokens = (total_input_tokens / pages_count) if pages_count else 0
+    avg_output_tokens = (total_output_tokens / pages_count) if pages_count else 0
+    avg_total_tokens = (total_tokens / pages_count) if pages_count else 0
+    avg_latency_s = (total_latency_s / pages_count) if pages_count else 0
+
+    stats = {
+        "pdf_name": base_name,
+        "pages": pages_count,
+        "per_page": per_page_metrics,
+        "totals": {
+            "time_s": total_time_s,
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
+            "total_tokens": total_tokens,
+            "latency_s": total_latency_s
+        },
+        "averages": {
+            "time_s": avg_latency_s,
+            "input_tokens": avg_input_tokens,
+            "output_tokens": avg_output_tokens,
+            "total_tokens": avg_total_tokens
+        }
+    }
+
+    stats_path = os.path.join(output_dir, f"{base_name}_stats.json")
+    with open(stats_path, 'w', encoding='utf-8') as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+    print(f"[save] Stats JSON: {stats_path}")
 
 
 def main():
