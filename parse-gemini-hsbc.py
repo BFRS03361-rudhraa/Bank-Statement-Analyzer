@@ -332,6 +332,8 @@ def structure_metadata_with_llm(raw_metadata_block: dict) -> dict:
     - ifsc_code
     - micr_code
     - statement_period
+    - bank name
+    - account type
 
     If a field is not present, leave it empty. Retain any existing key-value pairs that are clearly identified.
 
