@@ -6,13 +6,13 @@ Takes normalized Excel file and outputs a summary sheet matching the required fo
 
 from fsspec import transaction
 import pandas as pd
-from fraudsheet import df_duplicates
+# from fraudsheet import df_duplicates
 import numpy as np
 from datetime import datetime
 import calendar
 from rapidfuzz import fuzz
 import holidays
-from rc import similarity_threshold
+# from rc import similarity_threshold
 
 similarity_threshold =70  #for calculating the recurring debit and credit sheet
 
@@ -518,10 +518,10 @@ def generate_eod_balances(transactions_df):
 
     prev_month_last_balance = np.nan
     for period in months:
-        month_df = df[df['Month_Year'] == period].sort_values('Date')
+        month_df = df[df['Month_Year'] == period].sort_values('Date').sort_index()
         # Map day -> last balance that day
         day_last_balance = (
-            month_df.groupby(month_df['Date'].dt.day)['Balance_Clean'].last()
+            month_df.groupby(month_df['Date'].dt.day, sort=True)['Balance_Clean'].apply(lambda x: x.iloc[-1])
         )
         eod_values = []
         # Initialize with previous month's closing balance so the new month starts carried-forward
