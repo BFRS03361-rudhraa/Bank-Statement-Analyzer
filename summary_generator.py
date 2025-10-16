@@ -1765,8 +1765,8 @@ def generate_summary_sheet(normalized_file, output_file):
     summary_data.append([])
 
     # 4. Bounce/Return Identification
-
     bounce_data = []
+    bounce_data.append(['Bounce / Return Identification'])
     bounce_data.append(['Particulars', 'Details'])
     # Fix keyword list and counting
     bounce_keywords = ['bounce', 'returned', 'return', 'dishonour', 'insufficient funds', 'cheque return']
@@ -1809,6 +1809,7 @@ def generate_summary_sheet(normalized_file, output_file):
     salary_data = []
     salary_transactions, count= detect_salary_transactions(transactions_df)
     salary_data.append(['Total Salary Transaction', 'NA', count if salary_transactions else 0, 'NA'])
+    salary_data.append(['Total Salary Credit', 'NA', salary_transactions if salary_transactions else 0, 'NA'])
     summary_data.extend(salary_data)
     summary_df = pd.DataFrame(summary_data)
     summary_df.to_excel(output_file, sheet_name='Summary', index=False, header=False)
