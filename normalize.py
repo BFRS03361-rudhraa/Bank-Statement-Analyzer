@@ -286,6 +286,8 @@ def normalize_to_reference(excel_files):
             # Normalize headers to standard format
             df = normalize_headers(df)
             
+            df = validate_credit_debit(df)
+
             # Just detect date column, don't modify the data here
             date_col = detect_date_column(df)
             
@@ -318,6 +320,76 @@ def normalize_to_reference(excel_files):
         aggregated_metadata[key] = most_common[0][0] if most_common else ''
 
     return combined_transactions, aggregated_metadata
+
+import pandas as pd
+
+def validate_credit_debit(df):
+    """
+    Validates and corrects Credit/Debit values by comparing Amount with Balance change.
+    Preserves original transaction order (no sorting).
+    """
+
+    required_cols = {"Credit/Debit", "Amount", "Balance"}
+    if not required_cols.issubset(df.columns):
+        print("⚠️  Skipping validation: Missing one or more required columns.")
+        return df
+
+    df = df.copy()  # preserve original order
+    df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
+    df["Balance"] = pd.to_numeric(df["Balance"], errors="coerce")
+
+    inferred_types = [None]  # first txn has no prev balance reference
+    for i in range(1, len(df)):
+        prev_bal = df.loc[i - 1, "Balance"]
+        curr_bal = df.loc[i, "Balance"]
+        amt = abs(df.loc[i, "Amount"])
+
+        if pd.isna(prev_bal) or pd.isna(curr_bal) or pd.isna(amt):
+            inferred_types.append(None)
+            continue
+
+        if abs(curr_bal - (prev_bal + amt)) < 1e-3:
+            inferred_types.append("CREDIT")
+        elif abs(curr_bal - (prev_bal - amt)) < 1e-3:
+            inferred_types.append("DEBIT")
+        else:
+            inferred_types.append(None)
+
+    df["Inferred_Credit/Debit"] = inferred_types
+
+    # Identify mismatches
+    mismatches = df[
+        (df["Inferred_Credit/Debit"].notna()) &
+        (df["Credit/Debit"].notna()) &
+        (df["Inferred_Credit/Debit"] != df["Credit/Debit"])
+    ]
+
+    mismatch_count = len(mismatches)
+    total_txns = len(df)
+
+    print("\n===== CREDIT/DEBIT VALIDATION REPORT =====")
+    print(f"Total transactions: {total_txns}")
+    print(f"Mismatched transactions: {mismatch_count}")
+
+    if mismatch_count > 0:
+        print("\n⚠️  Mismatch Details:")
+        print(mismatches[["Date", "Description", "Credit/Debit", "Inferred_Credit/Debit", "Amount", "Balance"]].to_string(index=False))
+    else:
+        print("✅ No mismatches found. All transactions match balance movements.")
+
+    # Correct mislabeled or missing entries
+    df.loc[df["Inferred_Credit/Debit"].notna(), "Credit/Debit"] = df["Inferred_Credit/Debit"]
+
+    # Print summary
+    final_credit_count = (df["Credit/Debit"] == "CREDIT").sum()
+    final_debit_count = (df["Credit/Debit"] == "DEBIT").sum()
+
+    print("\n===== FINAL TRANSACTION TYPE COUNTS =====")
+    print(f"CREDIT: {final_credit_count}")
+    print(f"DEBIT:  {final_debit_count}")
+    print("=========================================\n")
+
+    return df.drop(columns=["Inferred_Credit/Debit"])
 
 
 def consolidate_excels(input_folder, output_file):
