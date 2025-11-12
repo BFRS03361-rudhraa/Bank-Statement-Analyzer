@@ -114,10 +114,32 @@ def ocr_with_gemini(image_path,canonical_header=None, hsbc_case=None):
         Extract the data from this financial document image as a structured JSON object with two keys:
         - "metadata": should ONLY contain account/customer information like account number, name, address, statement period, etc., present before the transaction table. Metadata should NEVER contain transaction rows, table headers, or any financial data. If no key-value metadata is found, extract the entire metadata block as a single string field under "raw_metadata".
         - "transactions": a list of objects, each representing a transaction with exact column names and values as present in the document.
-
-        Do NOT normalize, modify, or clean the data. Preserve every detail exactly as it appears with 100 percent accuracy. The values should be present in their exact columns with 100% accuracy , no values should be misplaced into other columns or adjacent empty columns so recheck every line properly .
+        
+        DO NOT miss or skip any transaction rows as we are dealing with very important bank transactions.
+        Do NOT normalize, modify, or clean the data. Preserve every detail exactly as it appears with 100 percent accuracy. 
+        The values in all the amount columns should be present in their exact columns with 100% ACCURATE.
+        Values should be NOT BE MISPLACED into other columns or adjacent empty columns so recheck every line properly .
         Do NOT invent any new keys or columns. If a column is missing a value, leave it as an empty string. Never shift values between columns.
         Only extract data that is directly visible. DO NOT MAKE UP ANY TRANSACTION THAT IS NOT VISIBLE.
+        You must output ONLY valid JSON.
+        Each field must be in the format: "key": "value"
+        Never use commas between key-value pairs — always use colons.
+
+
+        ### PAGE CONTINUATION RULE:
+        Sometimes the last transaction on one page has its **description continued at the top of the next page**.
+        When you see such rows at the top of a page that **only contain text in the description column** and all amount/balance columns are blank:
+        - Extract them exactly as they appear.
+        - Leave amount/balance/date columns as empty strings.
+        - DO NOT assign any numeric value from nearby rows.
+        - These partial rows will later be merged programmatically.
+
+        COUNT AND VERIFY
+        Before responding:
+        - Count visible transaction rows in image: X
+        - Count transaction objects in your JSON: Y
+        - If X ≠ Y, re-extract missing rows
+
 
         {header_instruction}  
         Example output:
@@ -132,6 +154,32 @@ def ocr_with_gemini(image_path,canonical_header=None, hsbc_case=None):
             ...
         ]
         }}
+
+
+        SELF-VERIFICATION CHECKLIST:
+        □ Did I extract EVERY visible transaction row?
+        □ Are ALL amounts in their correct columns (not shifted to adjacent columns)?
+        □ Did I use EXACT column names from the document header?
+        □ Did I avoid inventing any data not visible in the image?
+        □ Is every transaction complete with all column values?
+
+        CRITICAL RULES:
+        1. Extract ONLY what you see - never invent data
+        2. Preserve exact column names from document header row
+        3. Keep values in original columns - never shift to adjacent empty columns
+        4. Empty cells = "" (do not use null or fill with adjacent values)
+        5. Extract ALL rows - missing even one row is a critical failure
+        6. Never use commas between key-value pairs — always use colons.
+        7. Never apply the page continuation rules for the txns inbetween the pages , Only apply them for the first and last transaction of the page
+        COMMON MISTAKES TO AVOID:
+        ❌ Shifting amount from "Debit" to "Credit" column
+        ❌ Shifting amount from "Withdrwal" to "Deposit Amt" column
+        ❌ Shifting txn type DR or CR values to adjacent column
+        ❌ Shifting branch name from branch name column to adjacent column
+        ❌ Moving values to adjacent empty columns
+        ❌ Skipping rows at page boundaries
+        ❌ Changing column names (e.g., "Txn Date" → "Date")
+        ❌ Inventing values for empty cells
         """
     print(f"[ocr] Preprocessing image for OCR: {image_path}")
     image = preprocess_image_for_ocr(image_path)
@@ -193,86 +241,226 @@ def ocr_with_gemini_with_fallback(image_path, canonical_header=None, hsbc=None):
         }
         combined_dt = top_dt + bottom_dt
 
-        return {"metadata": combined_metadata, "transactions": combined_transactions,"Narrative":combined_narrative, "_metrics": {"input_tokens": combined_usage["input_tokens"], "output_tokens": combined_usage["output_tokens"], "total_tokens": combined_usage["total_tokens"], "latency_s": combined_dt, "fallback_used": True}}
+        result = {"metadata": combined_metadata, "transactions": combined_transactions,"Narrative":combined_narrative, "_metrics": {"input_tokens": combined_usage["input_tokens"], "output_tokens": combined_usage["output_tokens"], "total_tokens": combined_usage["total_tokens"], "latency_s": combined_dt, "fallback_used": True}}
+        # attach raw for debugging
+        result["_raw"] = {"mode": "fallback", "top_text": top_text, "bottom_text": bottom_text}
+        return result
 
     # No fallback needed; attach metrics from the single call
     parsed["_metrics"] = {"input_tokens": usage_info["input_tokens"], "output_tokens": usage_info["output_tokens"], "total_tokens": usage_info["total_tokens"], "latency_s": dt, "fallback_used": False}
+    # attach raw for debugging
+    parsed["_raw"] = {"mode": "single", "text": text}
     return parsed
 
 
 
-def parse_json_from_llm(text: str, hsbc=None):
+
+def parse_json_from_llm(text: str, hsbc=None, prefer: str = "best"):
     """
     Parse the first valid JSON object from the LLM response text.
     Returns a dict with 'metadata' and 'transactions' keys.
     """
     if not text or not text.strip():
-        if(hsbc):
-            return {"metadata": {}, "transactions": [], "Narrative":[]}
-        else:return {"metadata": {}, "transactions": []}
+        print("[json parse] Empty text provided")
+        if hsbc:
+            return {"metadata": {}, "transactions": [], "Narrative": []}
+        else:
+            return {"metadata": {}, "transactions": []}
+
+    print(f"[json parse] Parsing text of length {len(text)}")
+
+    # Normalize common wrappers: strip labels like 'top'/'bottom' and markdown fences
+    cleaned = text.strip()
+    cleaned = re.sub(r"^(top|bottom)\s*", "", cleaned, flags=re.IGNORECASE)
+
+    if cleaned.startswith("```"):
+        first_newline = cleaned.find("\n")
+        if first_newline != -1:
+            inner = cleaned[first_newline + 1 :]
+            if inner.endswith("```"):
+                inner = inner[:-3]
+            cleaned = inner.strip()
+
+    # Slice from first '{' to last '}' to isolate the likely JSON section
+    first_brace = cleaned.find("{")
+    last_brace = cleaned.rfind("}")
+    candidate = (
+        cleaned[first_brace : last_brace + 1]
+        if first_brace != -1 and last_brace != -1 and last_brace > first_brace
+        else cleaned
+    )
+
+    # --- Attempt direct parse
+    try:
+        obj = json.loads(candidate)
+        if isinstance(obj, dict):
+            transactions_count = len(obj.get("transactions", []))
+            print(f"[json parse] Direct parse success: {transactions_count} transactions")
+            if hsbc:
+                return {
+                    "metadata": obj.get("metadata", {}),
+                    "transactions": obj.get("transactions", []),
+                    "Narrative": obj.get("Narrative", []),
+                }
+            else:
+                return {
+                    "metadata": obj.get("metadata", {}),
+                    "transactions": obj.get("transactions", []),
+                }
+    except Exception as e:
+        print(f"[json parse] Direct parse failed: {e}")
+
+    # --- Repair logic for malformed JSON
+    def _repair_json_text(s: str) -> str:
+        repaired = s
+
+        # --- Fix 1: Convert `"Key", "Value"` → `"Key": "Value"`
+        repaired = re.sub(
+            r'"([^"]+)"\s*,\s*\n?\s*"([^"]+)"',
+            lambda m: f'"{m.group(1)}": "{m.group(2)}"',
+            repaired,
+        )
+
+        # --- Fix 2: Handle `"Key",` without value → `"Key": ""`
+        repaired = re.sub(
+            r'"([^"]+)"\s*,\s*(?=[}\]\n\r])',
+            lambda m: f'"{m.group(1)}": ""',
+            repaired,
+        )
+
+        # --- Fix 3: Remove stray commas before closing braces/brackets
+        repaired = re.sub(r",\s*(\}|\])", r"\1", repaired)
+
+        # --- Fix 4: Add commas between adjacent objects if missing
+        repaired = re.sub(r"\}\s*\{", "}, {", repaired)
+
+        # --- Fix 5: Normalize double newlines
+        repaired = re.sub(r"\n\s*\n", "\n", repaired)
+
+        return repaired
 
     try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            if(hsbc):
-                return {
-                    "metadata": obj.get("metadata", {}),
-                    "transactions": obj.get("transactions", []),
-                    "Narrative": obj.get("Narrative",[])
-                }
-            else :
-                return {
-                    "metadata": obj.get("metadata", {}),
-                    "transactions": obj.get("transactions", []),
-                }
-    except Exception:
-        pass
+        repaired = _repair_json_text(candidate)
 
-    # Fallback: try extracting the largest JSON block
-    block = _extract_largest_json_object(text,hsbc=hsbc)
+        # Debug safeguard
+        if '"Chq./Ref.No.",' in repaired:
+            print("[debug] Unfixed key-value pair detected after repair!")
+
+        obj = json.loads(repaired)
+        if isinstance(obj, dict):
+            transactions_count = len(obj.get("transactions", []))
+            print(f"[json parse] Repaired parse success: {transactions_count} transactions")
+            if hsbc:
+                return {
+                    "metadata": obj.get("metadata", {}),
+                    "transactions": obj.get("transactions", []),
+                    "Narrative": obj.get("Narrative", []),
+                }
+            else:
+                return {
+                    "metadata": obj.get("metadata", {}),
+                    "transactions": obj.get("transactions", []),
+                }
+    except Exception as e:
+        print(f"[json parse] Repaired parse failed: {e}")
+
+    # --- Fallback extraction
+    print("[json parse] Trying fallback extraction...")
+
+    try:
+        repaired_full_text = _repair_json_text(cleaned)
+        block = _extract_largest_json_object(repaired_full_text, hsbc=hsbc)
+    except Exception as e:
+        print(f"[json parse] Repair-before-fallback failed: {e}")
+        block = _extract_largest_json_object(cleaned, hsbc=hsbc)
+
+    # block = _extract_largest_json_object(cleaned, hsbc=hsbc)
     if block:
-        # try:
-        #     if isinstance(block, dict):
-        #         return {
-        #             "metadata": obj.get("metadata", {}),
-        #             "transactions": obj.get("transactions", [])
-        #         }
-        # except Exception:
-        #     pass
+        transactions_count = len(block.get("transactions", []))
+        print(f"[json parse] Fallback extraction success: {transactions_count} transactions")
         return block
 
-    if hsbc: return {"metadata": {}, "transactions": [],"Narrative":[]}
+    print("[json parse] All parsing attempts failed")
+    if hsbc:
+        return {"metadata": {}, "transactions": [], "Narrative": []}
     return {"metadata": {}, "transactions": []}
 
+
 def _extract_largest_json_object(text: str,hsbc):
-    """Return the first JSON object that contains 'metadata' or 'transactions'."""
+    """Extract JSON objects and return the one with most transactions."""
     if not text:
         return None
-    matches = re.findall(r"\{[\s\S]*\}", text)
-    largest_obj = None
-
-    for m in matches:
-        try:
-            obj = json.loads(m)
-            if isinstance(obj, dict):
-                # Keep the largest JSON block (most keys/length)
-                if not largest_obj or len(json.dumps(obj)) > len(json.dumps(largest_obj)):
-                    largest_obj = obj
-        except Exception:
-            continue
-
-    if largest_obj:
+    
+    print(f"[json extract] Extracting from text of length {len(text)}")
+    
+    # Find all potential JSON objects using non-greedy matching
+    json_objects = []
+    
+    # Try to find complete JSON objects by counting braces
+    brace_count = 0
+    start_pos = -1
+    
+    for i, char in enumerate(text):
+        if char == '{':
+            if brace_count == 0:
+                start_pos = i
+            brace_count += 1
+        elif char == '}':
+            brace_count -= 1
+            if brace_count == 0 and start_pos != -1:
+                # Found complete JSON object
+                json_str = text[start_pos:i+1]
+                try:
+                    obj = json.loads(json_str)
+                    if isinstance(obj, dict):
+                        json_objects.append(obj)
+                        print(f"[json extract] Found valid JSON object with {len(obj.get('transactions', []))} transactions")
+                except Exception as e:
+                    print(f"[json extract] Failed to parse JSON object: {e}")
+    
+    print(f"[json extract] Found {len(json_objects)} JSON objects via brace counting")
+    
+    # If no complete objects found, try regex fallback
+    if not json_objects:
+        print("[json extract] Trying regex fallback...")
+        matches = re.findall(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", text)
+        print(f"[json extract] Regex found {len(matches)} potential matches")
+        for m in matches:
+            try:
+                obj = json.loads(m)
+                if isinstance(obj, dict):
+                    json_objects.append(obj)
+                    print(f"[json extract] Regex found valid JSON with {len(obj.get('transactions', []))} transactions")
+            except Exception as e:
+                print(f"[json extract] Regex match failed to parse: {e}")
+                continue
+    
+    # Find the object with the most transactions
+    best_obj = None
+    max_transactions = 0
+    
+    for i, obj in enumerate(json_objects):
+        transactions = obj.get('transactions', [])
+        print(f"[json extract] Object {i}: {len(transactions)} transactions")
+        if len(transactions) > max_transactions:
+            max_transactions = len(transactions)
+            best_obj = obj
+    
+    if best_obj:
+        print(f"[json extract] Selected best object with {max_transactions} transactions")
         if(hsbc):
-                return {
-                    "metadata": obj.get("metadata", {}),
-                    "transactions": obj.get("transactions", []),
-                    "Narrative": obj.get("Narrative",[])
-                }
-        else :
-                return {
-                    "metadata": obj.get("metadata", {}),
-                    "transactions": obj.get("transactions", []),
-                }
+            return {
+                "metadata": best_obj.get("metadata", {}),
+                "transactions": best_obj.get("transactions", []),
+                "Narrative": best_obj.get("Narrative",[])
+            }
+        else:
+            return {
+                "metadata": best_obj.get("metadata", {}),
+                "transactions": best_obj.get("transactions", []),
+            }
+    
+    print("[json extract] No valid JSON objects found")
     if hsbc: return {"metadata": {}, "transactions": [],"Narrative":[]}
     return {"metadata": {}, "transactions": []}
 
@@ -455,6 +643,33 @@ def process_pdf(pdf_path, output_dir,hsbc=None, pages=0):
 
         if i < 2:
             raw_metadata_blocks.append(page_obj.get('metadata', {}))
+
+        # Debug count check: estimate visible row count via quick heuristic prompt
+        try:
+            debug_prompt = """
+You are assisting with debugging OCR extraction. Based only on this image, output a small JSON with one key \"estimated_rows\" equal to the number of visible transaction table rows on this page (integer, best-effort). Output only JSON.
+"""
+            img_for_debug = preprocess_image_for_ocr(image_path)
+            dbg_resp = model.generate_content([debug_prompt, img_for_debug])
+            dbg_text = dbg_resp.text or "{}"
+            dbg_obj = parse_json_loose_structured(dbg_text) or {}
+            estimated_rows = int(dbg_obj.get("estimated_rows", 0))
+        except Exception:
+            estimated_rows = 0
+
+        parsed_rows = len(page_obj.get('transactions', []))
+        debug_page = {
+            "page_index": i + 1,
+            "image_path": image_path,
+            "estimated_rows": estimated_rows,
+            "parsed_rows": parsed_rows
+        }
+        debug_path = os.path.join(output_dir, f"{base_name}_page_{i+1}_debug.json")
+        try:
+            with open(debug_path, 'w', encoding='utf-8') as df:
+                json.dump(debug_page, df, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
         aggregated_transactions.extend(page_obj.get('transactions', []))
         if (hsbc) : aggregated_narrative.extend(page_obj.get('Narrative',[]))
