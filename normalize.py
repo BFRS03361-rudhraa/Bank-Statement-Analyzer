@@ -1,7 +1,9 @@
 from math import nan
+from operator import or_
 import os
 import re
 import pandas as pd
+import numpy as np
 from collections import Counter
 from difflib import get_close_matches
 
@@ -105,10 +107,10 @@ def normalize_headers(df):
     standard_columns = {
         'Credit/Debit': ['cr/dr','dr/cr', 'cr dr', 'credit debit', 'type', 'transaction type', 'debit credit'],
         'Description': ['description', 'narration','narrative', 'particulars', 'details', 'transaction details','remarks','naration'],
+        'Amount': ['amount', 'withdrawal (dr)/ deposit(cr)','transaction amount', 'transaction value', 'amount(inr)', 'transaction amount(inr)'],
         'Credit':['credit', 'credit amount', 'deposit', 'cr'],
         'Debit':['debit', 'debit amount','withdrawal', 'dr'],
         'Balance': ['balance', 'available balance', 'running balance', 'closing balance', 'available balance(inr)','total'],
-        'Amount': ['amount', 'transaction amount', 'transaction value', 'amount(inr)', 'transaction amount(inr)'],
         
     }
 
@@ -186,8 +188,8 @@ def normalize_headers(df):
     else:
         # Otherwise, keep the original Amount and Credit/Debit columns as they are
         if 'Amount' not in new_df.columns:
-            # if missing, try to infer from existing columns (optional)
-            pass  
+
+           pass 
 
 
     # ---- Step 3: Reorder columns ----
@@ -326,36 +328,77 @@ import pandas as pd
 def validate_credit_debit(df):
     """
     Validates and corrects Credit/Debit values by comparing Amount with Balance change.
-    Preserves original transaction order (no sorting).
+    - Preserves original transaction order (no sorting)
+    - Infers missing Amount if possible
+    
     """
+    df = df.copy()
+    if 'Balance' not in df.columns:
+        return df
+
+    # --- ADD THIS ---
+    df['Balance'] = (
+    df['Balance']
+    .apply(clean_amount)
+    .replace('', np.nan)
+)
+    df['Balance'] = pd.to_numeric(df['Balance'], errors='coerce')
+
+# Drop rows where Balance is still NaN (optional)
+    df = df[df['Balance'].notna()].reset_index(drop=True)
+    if 'Amount' not in df.columns:
+        print("Inferring Amount and Credit/Debit from balance difference...")
+        df['Balance'] = df['Balance'].apply(clean_amount)
+        df['Amount'] = df['Balance'].diff().abs().round(2)
+        df['Credit/Debit'] = df['Balance'].diff().apply(lambda x: 'CREDIT' if x > 0 else ('DEBIT' if x < 0 else pd.NA))
+        return df
+
+
+
 
     required_cols = {"Credit/Debit", "Amount", "Balance"}
     if not required_cols.issubset(df.columns):
         print("⚠️  Skipping validation: Missing one or more required columns.")
         return df
 
-    df = df.copy()  # preserve original order
+    df = df.copy()
     df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
     df["Balance"] = pd.to_numeric(df["Balance"], errors="coerce")
 
-    inferred_types = [None]  # first txn has no prev balance reference
+    inferred_types = [None]  # first txn has no previous reference
+    inferred_amounts = [df.loc[0, "Amount"]]  # keep original first amount
+
     for i in range(1, len(df)):
         prev_bal = df.loc[i - 1, "Balance"]
         curr_bal = df.loc[i, "Balance"]
-        amt = abs(df.loc[i, "Amount"])
+        amt = df.loc[i, "Amount"]
 
-        if pd.isna(prev_bal) or pd.isna(curr_bal) or pd.isna(amt):
+        if pd.isna(prev_bal) or pd.isna(curr_bal):
             inferred_types.append(None)
+            inferred_amounts.append(amt)
             continue
 
-        if abs(curr_bal - (prev_bal + amt)) < 1e-3:
-            inferred_types.append("CREDIT")
-        elif abs(curr_bal - (prev_bal - amt)) < 1e-3:
-            inferred_types.append("DEBIT")
+        balance_diff = curr_bal - prev_bal
+
+        # If amount missing, infer from balance difference
+        if pd.isna(amt):
+            amt_inferred = abs(balance_diff)
         else:
-            inferred_types.append(None)
+            amt_inferred = abs(amt)
+
+        # Determine credit/debit type
+        if abs(balance_diff - amt_inferred) < 1e-3:
+            inferred_type = "CREDIT"
+        elif abs(balance_diff + amt_inferred) < 1e-3:
+            inferred_type = "DEBIT"
+        else:
+            inferred_type = None  # ambiguous
+
+        inferred_types.append(inferred_type)
+        inferred_amounts.append(amt if not pd.isna(amt) else amt_inferred)
 
     df["Inferred_Credit/Debit"] = inferred_types
+    df["Inferred_Amount"] = inferred_amounts
 
     # Identify mismatches
     mismatches = df[
@@ -364,32 +407,42 @@ def validate_credit_debit(df):
         (df["Inferred_Credit/Debit"] != df["Credit/Debit"])
     ]
 
+    missing_amounts_fixed = df["Amount"].isna().sum() - df["Inferred_Amount"].isna().sum()
     mismatch_count = len(mismatches)
     total_txns = len(df)
 
     print("\n===== CREDIT/DEBIT VALIDATION REPORT =====")
     print(f"Total transactions: {total_txns}")
-    print(f"Mismatched transactions: {mismatch_count}")
+    print(f"Mismatched transaction types: {mismatch_count}")
+    print(f"Missing amounts inferred: {missing_amounts_fixed}")
 
     if mismatch_count > 0:
         print("\n⚠️  Mismatch Details:")
-        print(mismatches[["Date", "Description", "Credit/Debit", "Inferred_Credit/Debit", "Amount", "Balance"]].to_string(index=False))
+        print(
+            mismatches[["Date", "Description", "Credit/Debit", "Inferred_Credit/Debit", "Amount", "Balance"]]
+            .to_string(index=False)
+        )
     else:
-        print("✅ No mismatches found. All transactions match balance movements.")
+        print("✅ No mismatched credit/debit labels found.")
 
-    # Correct mislabeled or missing entries
+    # Apply inferred corrections
     df.loc[df["Inferred_Credit/Debit"].notna(), "Credit/Debit"] = df["Inferred_Credit/Debit"]
+    df.loc[df["Inferred_Amount"].notna(), "Amount"] = df["Inferred_Amount"]
 
-    # Print summary
+    # Drop helper columns
+    df = df.drop(columns=["Inferred_Credit/Debit", "Inferred_Amount"])
+
+    # Summary
     final_credit_count = (df["Credit/Debit"] == "CREDIT").sum()
     final_debit_count = (df["Credit/Debit"] == "DEBIT").sum()
 
-    print("\n===== FINAL TRANSACTION TYPE COUNTS =====")
+    print("\n===== FINAL TRANSACTION COUNTS =====")
     print(f"CREDIT: {final_credit_count}")
     print(f"DEBIT:  {final_debit_count}")
-    print("=========================================\n")
+    print("====================================\n")
 
-    return df.drop(columns=["Inferred_Credit/Debit"])
+    return df
+
 
 
 def consolidate_excels(input_folder, output_file):
