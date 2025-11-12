@@ -93,7 +93,8 @@ def generate_scoring_details(transactions_df):
     total_debit_count = int(df['Debit_Amount'].notna().sum())
 
     # Monthly Average Surplus = mean(credit_sum - debit_sum)
-    monthly_surplus = round((monthly['credit_sum'] - monthly['debit_sum']).mean(), 2) if not monthly.empty else 0
+    monthly_surplus = round((total_credit_amount-total_debit_amount)/ len(monthly), 2) if not monthly.empty else 0
+    print(len(monthly))
 
     # Foir placeholder (needs liabilities to compute). Mark as NA to match screenshot.
     foi_ratio = 'NA'
@@ -1581,6 +1582,114 @@ def generate_fraud_sheet(transactions_df, duplicates_df):
 
     return fraud_summary_df
 
+def generate_top_10_credit(transactions_df):
+    """Generate top 10 credit transactions sorted by amount in descending order."""
+    if transactions_df.empty or 'Credit/Debit' not in transactions_df.columns:
+        return pd.DataFrame()
+    
+    # Filter for credit transactions
+    df_credit = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'CREDIT'].copy()
+    
+    if df_credit.empty:
+        return pd.DataFrame()
+    
+    # Clean amount column
+    df_credit['Amount_Clean'] = df_credit['Amount'].astype(str).str.replace(',', '').str.replace(' ', '')
+    df_credit['Amount_Clean'] = pd.to_numeric(df_credit['Amount_Clean'], errors='coerce')
+    
+    # Sort by amount in descending order and take top 10
+    df_credit = df_credit.sort_values('Amount_Clean', ascending=False).head(10)
+    
+    # Select standard columns
+    columns_order = ['Date', 'Credit/Debit', 'Description', 'Amount', 'Balance']
+    top_10_credit = df_credit[columns_order]
+    
+    return top_10_credit
+
+def generate_top_10_debit(transactions_df):
+    """Generate top 10 debit transactions sorted by amount in descending order."""
+    if transactions_df.empty or 'Credit/Debit' not in transactions_df.columns:
+        return pd.DataFrame()
+    
+    # Filter for debit transactions
+    df_debit = transactions_df[transactions_df['Credit/Debit'].str.upper() == 'DEBIT'].copy()
+    
+    if df_debit.empty:
+        return pd.DataFrame()
+    
+    # Clean amount column
+    df_debit['Amount_Clean'] = df_debit['Amount'].astype(str).str.replace(',', '').str.replace(' ', '')
+    df_debit['Amount_Clean'] = pd.to_numeric(df_debit['Amount_Clean'], errors='coerce')
+    
+    # Sort by amount in descending order and take top 10
+    df_debit = df_debit.sort_values('Amount_Clean', ascending=False).head(10)
+    
+    # Select standard columns
+    columns_order = ['Date', 'Credit/Debit', 'Description', 'Amount', 'Balance']
+    top_10_debit = df_debit[columns_order]
+    
+    return top_10_debit
+
+def generate_top_10_monthly(transactions_df):
+    """Generate top 10 transactions for each month present in the data."""
+    if transactions_df.empty or 'Date' not in transactions_df.columns:
+        return pd.DataFrame()
+    
+    # Convert Date column to datetime
+    transactions_df['Date'] = pd.to_datetime(transactions_df['Date'], format='%d/%m/%Y', errors='coerce')
+    
+    # Drop rows with invalid dates
+    transactions_df = transactions_df.dropna(subset=['Date'])
+    
+    if transactions_df.empty:
+        return pd.DataFrame()
+    
+    # Extract month-year for grouping
+    transactions_df['Month_Year'] = transactions_df['Date'].dt.to_period('M')
+    
+    # Clean amount column
+    transactions_df['Amount_Clean'] = transactions_df['Amount'].astype(str).str.replace(',', '').str.replace(' ', '')
+    transactions_df['Amount_Clean'] = pd.to_numeric(transactions_df['Amount_Clean'], errors='coerce')
+    
+    # Get unique months
+    months = transactions_df['Month_Year'].unique()
+    months = sorted(months)
+    
+    # List to store top 10 transactions for each month
+    all_monthly_top = []
+    
+    for month_year in months:
+        # Create a header row with month/year information
+        month_name = calendar.month_abbr[month_year.month]
+        header_row = pd.DataFrame([{
+            'Date': f'** {month_name}-{str(month_year.year)[-2:]} **',
+            'Credit/Debit': '',
+            'Description': '',
+            'Amount': '',
+            'Balance': ''
+        }])
+        
+        # Filter transactions for this month
+        month_transactions = transactions_df[transactions_df['Month_Year'] == month_year].copy()
+        
+        # Sort by amount in descending order and take top 10
+        month_top_10 = month_transactions.sort_values('Amount_Clean', ascending=False).head(10)
+        
+        # Select standard columns
+        columns_order = ['Date', 'Credit/Debit', 'Description', 'Amount', 'Balance']
+        month_top_10 = month_top_10[columns_order]
+        
+        # Combine header and transactions
+        all_monthly_top.append(header_row)
+        all_monthly_top.append(month_top_10)
+    
+    # Concatenate all months
+    if all_monthly_top:
+        top_10_monthly_df = pd.concat(all_monthly_top, ignore_index=True)
+        return top_10_monthly_df
+    else:
+        return pd.DataFrame()
+
 def generate_xns_sheet(transactions_df):
 
     def detect_mode(description):
@@ -1849,6 +1958,15 @@ def generate_summary_sheet(normalized_file, output_file):
     # else: 
     #     fraud_sheet_df,sus_txns_df = generate_fraud_sheet(transactions_df.copy())
 
+    print("[INFO] Generating Top 10 Credit Transactions...")
+    top_10_credit_df = generate_top_10_credit(transactions_df.copy())
+    
+    print("[INFO] Generating Top 10 Debit Transactions...")
+    top_10_debit_df = generate_top_10_debit(transactions_df.copy())
+    
+    print("[INFO] Generating Top 10 Monthly Transactions...")
+    top_10_monthly_df = generate_top_10_monthly(transactions_df.copy())
+
     
     
     # Save to Excel
@@ -1874,6 +1992,12 @@ def generate_summary_sheet(normalized_file, output_file):
                duplicates_df.to_excel(writer ,index=False , sheet_name='Fraud Check Sheet', startrow=len(fraud_sheet_df+sus_txns_df))
         if not xns_txn_df.empty:
             xns_txn_df.to_excel(writer, index=False, sheet_name='Xns')
+        if not top_10_credit_df.empty:
+            top_10_credit_df.to_excel(writer, index=False, sheet_name='Top 10 Credit')
+        if not top_10_debit_df.empty:
+            top_10_debit_df.to_excel(writer, index=False, sheet_name='Top 10 Debit')
+        if not top_10_monthly_df.empty:
+            top_10_monthly_df.to_excel(writer, index=False, sheet_name='Top 10 Monthly')
 
     
     print(f"[SUCCESS] Saved summary sheet to {output_file}")
